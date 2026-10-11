@@ -112,7 +112,7 @@ CCX, CCZ, CZ, phase gates, and ordinary/controlled rotations stay native by defa
 
 - `--decompose-ccx` to decompose CCX and CCZ
 - `--decompose-cz` to decompose CZ into CX+H
-- `--decompose-rotations` to decompose P, Rz/Rx/Ry, CP, and CRz/CRx/CRy via gridsynth, with independently verified per-input-gate error bounds
+- `--decompose-rotations` to decompose P, Rz/Rx/Ry, CP, and CRz/CRx/CRy via gridsynth
   (`--decompose-rz` remains a compatibility alias)
 
 **PBC circuits**

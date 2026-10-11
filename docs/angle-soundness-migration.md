@@ -88,24 +88,23 @@ The optimization driver propagates that error. The infallible `Pass` adapter
 returns its original circuit on failure; use `try_run` or the driver when synthesis
 is required. Calls remain serialized around gridsynth's global precision state.
 
-Rotation synthesis now prepares accepted angles using temporary integer
-intervals and mathematical-pi bounds. It supplies the dependency's high-precision
-target directly and independently verifies its output with an enclosing matrix
-norm. Epsilon includes conversion and reduction error and applies per input
-gate. Controlled rotations also receive a complete two-qubit verification.
-Limits or failed certification produce an error. See the [API contract](../API.md)
-for limits and the [detailed design](numerical-accuracy-f64-design.md) for the
-arithmetic and validation rules.
+Gridsynth's current `config_from_theta_epsilon` converts a floating target through
+its decimal spelling and computes its working precision from epsilon. This
+implementation does not certify that decimal target conversion, mathematical-pi
+conversion, or the synthesis result against the accepted angle. Reports therefore
+state that total conversion and whole-circuit error are uncertified. Epsilon is a
+per-rotation parameter for the numeric synthesis target. The human CLI summary
+also states this scope whenever synthesis occurs; quiet mode retains only the
+structured report. Bounds greater than one use one internally to avoid unsigned
+underflow in the dependency's precision calculation. Certified interval
+conversion, verified synthesis error, and whole-circuit budgeting remain the
+separate feature specified by the design.
 
 The numeric Qiskit and PennyLane input adapters continue to supply finite numeric
-angles. Pi fractions are never inferred from their floats. Both output adapters
-now use the shared Rust `qasm::serialize_sdk` export to keep named quarter-turn
-gates separate from numeric residuals on every supported rotation axis. Their
-Python reconstruction accepts only finite numeric literals. Controlled branch
-phases are preserved, and symbolic angles without an exact numeric-parameter
-expansion fail instead of being silently rounded. Existing symbolic/trainable
-input rejections remain in place. The explicitly lossy export covers all eight
-angle-bearing gates and counts uncertified conversions per input gate.
+angles. Pi fractions are never inferred from their floats. Mixed folds emit named
+quarter-turn gates plus numeric residuals, so those adapters do not introduce
+implicit symbolic-to-numeric conversion. Existing symbolic/trainable-input
+rejections remain in place.
 
 ## Diagnostics
 
@@ -115,8 +114,7 @@ Rust `Report::numerical`, Python `OptimizationReport.numerical`, and CLI JSON
 - preserved input expressions and numerical input fallbacks;
 - skipped folds due to rounding, nonfinite arithmetic, or coefficient limits;
 - whether the configured pipeline uses unchecked randomized matching;
-- certified synthesis calls, failed certifications, and the outward-rounded sum
-  of synthesis bounds (with the legacy uncertified count retained).
+- the number of uncertified synthesis calls.
 
 Counters are per optimization run and propagated to parallel workers, rather than
 shared globally between unrelated runs. Their values can differ when chunk
