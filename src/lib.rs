@@ -1,6 +1,7 @@
 #![doc = include_str!("../API.md")]
 
 pub mod angle;
+mod angle_export;
 mod angle_expr;
 pub mod angle_stats;
 pub mod symbolic_angle;
@@ -16,6 +17,7 @@ pub mod phase_fold_pauli;
 pub mod phase_fold_rand;
 pub mod qasm;
 pub mod super_opt;
+mod synthesis;
 
 #[cfg(feature = "python")]
 mod python;

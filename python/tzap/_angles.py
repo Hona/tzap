@@ -1,39 +1,21 @@
-"""Numerical conversion of tzap's emitted constant angle expressions."""
+"""Safe native export and literal-only reconstruction of SDK angles."""
 
-from __future__ import annotations
-
-import ast
 import math
+
+from . import _native
+
+
+def sdk_qasm(source: str) -> str:
+    """Expand symbolic quarter turns without rounding them into SDK parameters."""
+    return _native._sdk_qasm(source)
 
 
 def angle_radians(source: str) -> float:
-    """Convert the restricted constant expression grammar without executing code."""
-
-    def value(node: ast.AST) -> float:
-        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
-            return float(node.value)
-        if isinstance(node, ast.Name) and node.id == "pi":
-            return math.pi
-        if isinstance(node, ast.UnaryOp):
-            operand = value(node.operand)
-            if isinstance(node.op, ast.UAdd):
-                return operand
-            if isinstance(node.op, ast.USub):
-                return -operand
-        if isinstance(node, ast.BinOp):
-            left, right = value(node.left), value(node.right)
-            if isinstance(node.op, ast.Add):
-                return left + right
-            if isinstance(node.op, ast.Sub):
-                return left - right
-            if isinstance(node.op, ast.Mult):
-                return left * right
-            if isinstance(node.op, ast.Div):
-                return left / right
-        raise ValueError("unsupported angle expression")
-
-    expression = ast.parse(source, mode="eval")
-    result = value(expression.body)
+    """Accept only finite numeric literals emitted by the safe native export."""
+    try:
+        result = float(source)
+    except ValueError as error:
+        raise ValueError("SDK angle must be a finite numeric literal") from error
     if not math.isfinite(result):
-        raise ValueError("angle must be finite")
+        raise ValueError("SDK angle must be finite")
     return result

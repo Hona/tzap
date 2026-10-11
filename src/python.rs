@@ -19,7 +19,18 @@ create_exception!(_native, QasmError, TzapError);
 create_exception!(_native, OptimizationError, TzapError);
 
 type RawMetrics = (usize, usize, usize, usize, usize);
-type RawNumerical = (usize, usize, usize, usize, usize, usize, bool);
+type RawNumerical = (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    bool,
+    usize,
+    usize,
+    Option<f64>,
+);
 type RawReport = (RawMetrics, RawMetrics, RawMetrics, RawNumerical);
 
 fn raw_metrics(metrics: Metrics) -> RawMetrics {
@@ -45,6 +56,9 @@ fn raw_report(report: Report) -> RawReport {
             report.numerical.skipped_coefficient_limit_folds,
             report.numerical.uncertified_syntheses,
             report.numerical.randomized_matching,
+            report.numerical.certified_syntheses,
+            report.numerical.failed_certifications,
+            report.numerical.certified_error_bound,
         ),
     )
 }
@@ -173,10 +187,18 @@ fn _optimize_qasm(
     Ok((output, raw_report(report)))
 }
 
+/// Convert native output without collapsing mixed angles into SDK floats.
+#[pyfunction]
+fn _sdk_qasm(qasm: &str) -> PyResult<String> {
+    let circuit = Circuit::from_qasm(qasm).map_err(QasmError::new_err)?;
+    crate::qasm::serialize_sdk(&circuit).map_err(OptimizationError::new_err)
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_optimize_qasm, module)?)?;
+    module.add_function(wrap_pyfunction!(_sdk_qasm, module)?)?;
     let tzap_error = module.py().get_type::<TzapError>();
     let qasm_error = module.py().get_type::<QasmError>();
     let optimization_error = module.py().get_type::<OptimizationError>();

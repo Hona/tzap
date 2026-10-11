@@ -132,7 +132,7 @@ jobs:
       - name: Test Python integrations
         run: |
           uv venv --python "${{ matrix.python }}"
-          uv pip install -e . "pytest>=7" \
+          uv pip install -e ".[test]" \
             "${{ matrix.qiskit }}" "${{ matrix.pennylane }}" \
             "${{ matrix.autoray }}"
           uv run --no-sync pytest tests/python
