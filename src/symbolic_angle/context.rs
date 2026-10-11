@@ -98,17 +98,20 @@ impl AngleContext {
         let b = self.scale_inner(b, &Rational::integer(-1), &mut budget)?;
         self.add_inner(a, &b, &mut budget)
     }
+    #[inline]
     pub fn neg(&mut self, a: &Angle) -> Result<Angle, Error> {
         let mut budget = self.inputs(&[a])?;
         self.scale_inner(a, &Rational::integer(-1), &mut budget)
     }
+    #[inline]
     pub fn scale(&mut self, a: &Angle, coefficient: &Rational) -> Result<Angle, Error> {
         let mut budget = self.inputs(&[a])?;
         budget.bits(coefficient.bits())?;
         self.scale_inner(a, coefficient, &mut budget)
     }
+    #[inline]
     pub fn half(&mut self, a: &Angle) -> Result<Angle, Error> {
-        self.scale(a, &Rational::new(1, 2)?)
+        self.scale(a, &Rational::canonical(1, 2))
     }
     pub fn mul(&mut self, a: &Angle, b: &Angle) -> Result<Angle, Error> {
         let mut budget = self.inputs(&[a, b])?;
@@ -359,7 +362,12 @@ impl AngleContext {
         if let Some((an, bn, ad, bd, pi)) = inline {
             use num_integer::Integer;
             let d = ad.max(bd);
-            let n = an as i64 * (d / ad) as i64 + bn as i64 * (d / bd) as i64;
+            let n = if ad == bd {
+                an as i64 + bn as i64
+            } else {
+                ((an as i64) << (d.trailing_zeros() - ad.trailing_zeros()))
+                    + ((bn as i64) << (d.trailing_zeros() - bd.trailing_zeros()))
+            };
             let gcd = if d.is_power_of_two() {
                 1_u64 << n.unsigned_abs().trailing_zeros().min(d.trailing_zeros())
             } else {
@@ -379,6 +387,25 @@ impl AngleContext {
                 budget.charge(1)?;
                 budget.value(&result)?;
                 return Ok(result);
+            }
+        }
+        if let (Value::Dyadic(a), Value::Dyadic(b)) = (&a.0, &b.0)
+            && let Some(result) = dyadic::add(*a, *b)
+        {
+            budget.charge(1)?;
+            budget.value(&result)?;
+            return Ok(result);
+        }
+        // Recognize a single negative term directly, avoiding temporary vectors.
+        for (term, atom) in [(a, b), (b, a)] {
+            if let Some(NodeKind::Sum(terms)) = term.kind()
+                && terms.len() == 1
+                && terms[0].coefficient.as_small() == Some((-1, 1))
+            {
+                budget.charge(atom.expression_nodes())?;
+                if terms[0].atom == *atom {
+                    return Ok(Angle::ZERO);
+                }
             }
         }
         if let (Some(a), Some(b)) = (a.as_rational(), b.as_rational()) {
@@ -516,6 +543,20 @@ impl AngleContext {
         if r.is_one() {
             return Ok(a.clone());
         }
+        if let Value::Dyadic(bits) = &a.0
+            && let Some((n, d)) = r.as_small()
+            && n.unsigned_abs().is_power_of_two()
+            && d.is_power_of_two()
+            && let Some(result) = dyadic::scale(
+                *bits,
+                n.unsigned_abs().trailing_zeros() as i32 - d.trailing_zeros() as i32,
+                n < 0,
+            )
+        {
+            budget.charge(1)?;
+            budget.value(&result)?;
+            return Ok(result);
+        }
         if let Some(v) = a.as_rational() {
             return self.number(v.mul(r, budget)?, false, budget);
         }
@@ -582,18 +623,27 @@ impl AngleContext {
             factors.iter().map(Angle::expression_nodes).sum(),
             budget,
         )?;
-        factors.sort_unstable();
+        factors.sort_unstable_by(|a, b| power_factor(a).0.cmp(power_factor(b).0));
         let mut combined = Vec::with_capacity(factors.len());
         let mut index = 0;
         while index < factors.len() {
+            let (base, exponent) = power_factor(&factors[index]);
+            let mut exponent = exponent as i128;
             let mut end = index + 1;
-            while end < factors.len() && factors[index] == factors[end] {
+            while end < factors.len() && power_factor(&factors[end]).0 == base {
+                exponent += power_factor(&factors[end]).1 as i128;
                 end += 1;
             }
+            // Keep valid factors when their combined exponent exceeds i64;
+            // normalization must not reject a representable exact expression.
             let factor = if end - index == 1 {
                 factors[index].clone()
+            } else if let Ok(exponent) = i64::try_from(exponent) {
+                self.pow_inner(base, exponent, budget)?
             } else {
-                self.pow_inner(&factors[index], (end - index) as i64, budget)?
+                combined.extend(factors[index..end].iter().cloned());
+                index = end;
+                continue;
             };
             if let Some(r) = factor.as_rational() {
                 coefficient = coefficient.mul(&r, budget)?;
@@ -608,6 +658,12 @@ impl AngleContext {
         if combined.len() == 1 {
             return self.scale_inner(&combined[0], &coefficient, budget);
         }
+        self.sort_budget(
+            combined.len(),
+            combined.iter().map(Angle::expression_nodes).sum(),
+            budget,
+        )?;
+        combined.sort_unstable();
         let sign = product_sign(&coefficient, &combined);
         self.intern(
             NodeKind::Product {
@@ -926,16 +982,18 @@ impl AngleContext {
         {
             return Err(invalid());
         }
-        let digits = format!("{whole}{fraction}");
-        let digits = digits.trim_start_matches('0');
-        if digits.is_empty() {
+        let significant_digits = whole
+            .bytes()
+            .chain(fraction.bytes())
+            .skip_while(|b| *b == b'0')
+            .count();
+        if significant_digits == 0 {
             return self.number(Rational::ZERO, false, budget);
         }
         let scale = (fraction.len() as i64)
             .checked_sub(exponent)
             .ok_or(Error::Limit(Resource::Bits))?;
-        let estimate = digits
-            .len()
+        let estimate = significant_digits
             .checked_add(
                 usize::try_from(scale.unsigned_abs()).map_err(|_| Error::Limit(Resource::Bits))?,
             )
@@ -943,6 +1001,29 @@ impl AngleContext {
             .ok_or(Error::Limit(Resource::Bits))?;
         budget.bits(estimate)?;
         budget.arithmetic(estimate)?;
+        if significant_digits <= 19 && scale.unsigned_abs() <= 19 {
+            let n = whole
+                .bytes()
+                .chain(fraction.bytes())
+                .try_fold(0_i128, |n, b| {
+                    n.checked_mul(10)?.checked_add((b - b'0') as i128)
+                });
+            if let Some(n) = n {
+                let n = if negative { -n } else { n };
+                let power = 10_i128.pow(scale.unsigned_abs() as u32);
+                let pair = if scale >= 0 {
+                    Some((n, power))
+                } else {
+                    n.checked_mul(power).map(|n| (n, 1))
+                };
+                if let Some((n, d)) = pair {
+                    let r = Rational::wide(n, d, budget)?;
+                    return self.number(r, false, budget);
+                }
+            }
+        }
+        let digits = format!("{whole}{fraction}");
+        let digits = digits.trim_start_matches('0');
         let mut n = BigInt::parse_bytes(digits.as_bytes(), 10).ok_or_else(invalid)?;
         if negative {
             n = -n;
@@ -957,6 +1038,13 @@ impl AngleContext {
         };
         let r = Rational::from_big(n, d, budget)?;
         self.number(r, false, budget)
+    }
+}
+
+fn power_factor(a: &Angle) -> (&Angle, i64) {
+    match a.kind() {
+        Some(NodeKind::Power(base, e)) => (base, *e),
+        _ => (a, 1),
     }
 }
 

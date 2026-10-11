@@ -16,6 +16,7 @@
 //! ```
 
 mod context;
+mod dyadic;
 mod parse;
 mod rational;
 
@@ -320,17 +321,17 @@ impl Angle {
     }
     #[inline]
     pub fn prove_zero(&self) -> Proof {
-        self.metadata().sign.zero()
+        self.sign().zero()
     }
     pub fn prove_positive(&self) -> Proof {
-        match self.metadata().sign {
+        match self.sign() {
             Sign::Positive => Proof::Proven,
             Sign::Negative | Sign::Zero | Sign::NonPositive => Proof::Disproven,
             _ => Proof::Unknown,
         }
     }
     pub fn prove_nonnegative(&self) -> Proof {
-        match self.metadata().sign {
+        match self.sign() {
             Sign::Positive | Sign::Zero | Sign::NonNegative => Proof::Proven,
             Sign::Negative => Proof::Disproven,
             _ => Proof::Unknown,
@@ -418,6 +419,20 @@ impl Angle {
             _ => None,
         }
     }
+    #[inline]
+    fn sign(&self) -> Sign {
+        match &self.0 {
+            Value::Shared(node) => node.meta.sign,
+            Value::Rational { n, .. } | Value::Pi { n, .. } => Sign::from_integer(n.signum() as i8),
+            Value::Dyadic(bits) => {
+                if bits >> 63 == 0 {
+                    Sign::Positive
+                } else {
+                    Sign::Negative
+                }
+            }
+        }
+    }
     fn metadata(&self) -> Metadata {
         match &self.0 {
             Value::Shared(node) => node.meta,
@@ -455,14 +470,14 @@ impl Angle {
             }
         }
     }
+    #[inline]
     fn fingerprint(&self) -> u64 {
-        if let Value::Shared(node) = &self.0 {
-            return node.hash;
+        match &self.0 {
+            Value::Shared(node) => node.hash,
+            Value::Rational { n, d } => small_number_hash(0, *n, *d),
+            Value::Pi { n, d } => small_number_hash(1, *n, *d),
+            Value::Dyadic(bits) => number_hash(0, &Rational::from_bits(*bits)),
         }
-        if let Some(r) = self.as_rational() {
-            return number_hash(0, &r);
-        }
-        number_hash(1, &self.pi_coefficient().expect("inline pi"))
     }
     fn category(&self) -> u8 {
         match &self.0 {
@@ -535,6 +550,13 @@ impl std::str::FromStr for Angle {
         AngleContext::default().parse(source)
     }
 }
+#[inline]
+fn small_number_hash(tag: u8, n: i32, d: u32) -> u64 {
+    let mut h = FxHasher::default();
+    tag.hash(&mut h);
+    Rational::hash_small(n as i64, d as u64, &mut h);
+    h.finish()
+}
 fn number_hash(tag: u8, r: &Rational) -> u64 {
     let mut h = FxHasher::default();
     tag.hash(&mut h);
@@ -593,3 +615,6 @@ impl fmt::Display for Angle {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod regression_tests;

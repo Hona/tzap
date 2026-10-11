@@ -1,6 +1,10 @@
 //! Run with `cargo run --release --example symbolic_angle_bench`.
 //! Microbenchmarks exercise the standalone scalar API, with no circuit passes.
-use std::{hint::black_box, time::Instant};
+use std::{
+    hash::{Hash, Hasher},
+    hint::black_box,
+    time::Instant,
+};
 use tzap::{
     angle::Angle as Legacy,
     symbolic_angle::{Angle, AngleContext, RotationPeriod},
@@ -90,5 +94,31 @@ fn main() {
             black_box(ctx.add(black_box(&big), black_box(&one)).unwrap());
         },
     );
+    let dyadic = Angle::from_f64(0.1).unwrap();
+    bench("core negate binary64 0.1", count, || {
+        black_box(ctx.neg(black_box(&dyadic)).unwrap());
+    });
+    bench("core halve binary64 0.1", count, || {
+        black_box(ctx.half(black_box(&dyadic)).unwrap());
+    });
+    let subnormal = Angle::from_f64(f64::from_bits(1)).unwrap();
+    bench("core add minimum subnormals", count, || {
+        black_box(
+            ctx.add(black_box(&subnormal), black_box(&subnormal))
+                .unwrap(),
+        );
+    });
+    bench("core parse decimal 0.125", count, || {
+        black_box(ctx.decimal(black_box("0.125")).unwrap());
+    });
+    bench("core parse sin(pi/7) cache hit", count, || {
+        black_box(ctx.parse(black_box("sin(pi/7)")).unwrap());
+    });
+    let big_coefficient = big.as_rational().unwrap();
+    bench("core hash 336-bit coefficient", count, || {
+        let mut hasher = rustc_hash::FxHasher::default();
+        black_box(&big_coefficient).hash(&mut hasher);
+        black_box(hasher.finish());
+    });
     println!("Interner: {:?}", ctx.stats());
 }

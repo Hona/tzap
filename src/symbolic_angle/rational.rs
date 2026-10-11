@@ -3,14 +3,19 @@ use num_bigint::BigInt;
 use num_integer::Integer;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
-use std::{cmp::Ordering, fmt, hash::Hash, sync::Arc};
+use std::{
+    cmp::Ordering,
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 /// A reduced rational. Machine-sized values allocate nothing; larger values
 /// share immutable arbitrary-precision storage. Construction is checked.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct Rational(Representation);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 enum Representation {
     Small { numerator: i64, denominator: u64 },
     Big(Arc<BigRational>),
@@ -47,6 +52,12 @@ impl Rational {
         })
     }
 
+    #[inline]
+    pub(super) fn hash_small<H: Hasher>(n: i64, d: u64, state: &mut H) {
+        0_u8.hash(state);
+        n.hash(state);
+        d.hash(state);
+    }
     pub fn as_small(&self) -> Option<(i64, u64)> {
         match &self.0 {
             Representation::Small {
@@ -92,13 +103,13 @@ impl Rational {
             Representation::Big(value) => value.numer().bits().max(value.denom().bits()) as usize,
         }
     }
-    /// Explicit conversion, allocating only for machine-sized values.
+    /// Explicit conversion to an owned arbitrary-precision rational.
     pub fn to_big_rational(&self) -> BigRational {
         match &self.0 {
             Representation::Small {
                 numerator,
                 denominator,
-            } => BigRational::new((*numerator).into(), (*denominator).into()),
+            } => BigRational::new_raw((*numerator).into(), (*denominator).into()),
             Representation::Big(value) => (**value).clone(),
         }
     }
@@ -122,7 +133,7 @@ impl Rational {
             Ok(Self(Representation::Big(Arc::new(value))))
         }
     }
-    fn wide(mut n: i128, mut d: i128, budget: &mut Budget) -> Result<Self, Error> {
+    pub(super) fn wide(mut n: i128, mut d: i128, budget: &mut Budget) -> Result<Self, Error> {
         if d == 0 {
             return Err(Error::DivisionByZero);
         }
@@ -186,6 +197,17 @@ impl Rational {
             }
         }
         budget.arithmetic(self.bits().max(rhs.bits()))?;
+        for (big, small) in [(self, rhs), (rhs, self)] {
+            if let Representation::Big(value) = &big.0
+                && let Some((n, 1)) = small.as_small()
+            {
+                // gcd(numerator + n*denominator, denominator) remains one.
+                return Self::from_reduced(
+                    BigRational::new_raw(value.numer() + value.denom() * n, value.denom().clone()),
+                    budget,
+                );
+            }
+        }
         Self::from_reduced(self.to_big_rational() + rhs.to_big_rational(), budget)
     }
     pub(super) fn neg(&self, budget: &mut Budget) -> Result<Self, Error> {
@@ -389,6 +411,47 @@ impl Rational {
             d.clone(),
             budget,
         )
+    }
+}
+
+// Every constructor reduces and demotes its result, so exact keys can compare
+// and hash the stored numerator/denominator without Ratio's repeated divisions.
+impl PartialEq for Rational {
+    fn eq(&self, rhs: &Self) -> bool {
+        match (&self.0, &rhs.0) {
+            (
+                Representation::Small {
+                    numerator: a,
+                    denominator: b,
+                },
+                Representation::Small {
+                    numerator: c,
+                    denominator: d,
+                },
+            ) => a == c && b == d,
+            (Representation::Big(a), Representation::Big(b)) => {
+                Arc::ptr_eq(a, b) || (a.numer() == b.numer() && a.denom() == b.denom())
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for Rational {}
+impl Hash for Rational {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match &self.0 {
+            Representation::Small {
+                numerator,
+                denominator,
+            } => {
+                Self::hash_small(*numerator, *denominator, state);
+            }
+            Representation::Big(value) => {
+                1_u8.hash(state);
+                value.numer().hash(state);
+                value.denom().hash(state);
+            }
+        }
     }
 }
 

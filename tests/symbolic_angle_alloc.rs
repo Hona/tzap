@@ -1,6 +1,7 @@
 //! One isolated test binary measures allocations in the hot scalar paths.
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    hash::{Hash, Hasher},
     hint::black_box,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
@@ -64,6 +65,25 @@ fn hot_scalar_paths_and_live_interned_functions_allocate_nothing() {
                 black_box(ctx.sin(&a).unwrap());
                 black_box(ctx.cos(&a).unwrap());
             }
+        }),
+        0
+    );
+    let dyadic = Angle::from_f64(0.1).unwrap();
+    let tiny = Angle::from_f64(f64::from_bits(1)).unwrap();
+    let negative = ctx.neg(&live_sin).unwrap();
+    let big = ctx.parse("1e100+1/7").unwrap().as_rational().unwrap();
+    assert_eq!(
+        allocations(|| {
+            black_box(ctx.neg(&dyadic).unwrap());
+            black_box(ctx.half(&dyadic).unwrap());
+            black_box(ctx.add(&tiny, &tiny).unwrap());
+            black_box(ctx.add(&live_sin, &negative).unwrap());
+            black_box(ctx.decimal("0.125").unwrap());
+            black_box(ctx.parse("0.1+0.2").unwrap());
+            black_box(ctx.parse("sin(pi/7)").unwrap());
+            let mut hasher = rustc_hash::FxHasher::default();
+            big.hash(&mut hasher);
+            black_box(hasher.finish());
         }),
         0
     );

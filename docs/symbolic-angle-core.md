@@ -51,6 +51,13 @@ Binary64 inputs also fit inline. Intermediate `Rational` values use `i64` and `u
 until arbitrary precision is needed. Larger scalar values and expression nodes use
 immutable shared storage.
 
+Addition of binary64 inputs and scaling by signed powers of two operate on
+integer significands. Exactly representable results stay inline; overflow,
+underflow, and sums that require rounding promote to exact rationals. Small
+decimal literals use machine arithmetic without temporary strings or big integers.
+Reduced coefficients compare and hash their stored numerator and denominator
+directly, avoiding repeated division during interning.
+
 Each context has its own weak interner. Keys include the full node structure;
 hash collisions never establish equality. Reconstructing a live canonical node
 in the same context shares its storage. Cloning an angle shares existing nodes,
@@ -68,7 +75,9 @@ returns false for inline values.
 
 Normalization reduces rationals, collects linear coefficients, sorts sums and
 products, and flattens their corresponding associative nodes. Repeated identical
-factors become integral powers. Exact rules include quarter-turn trig values,
+factors and existing powers of the same base combine by adding integral
+exponents. Factors remain separate when their combined exponent exceeds `i64`.
+Exact rules include quarter-turn trig values,
 odd and even parity, rational-pi trig periods, perfect-square roots,
 `sin(x)^2 + cos(x)^2`, and valid inverse-function compositions. Multiplication
 does not expand arbitrary sums.
@@ -119,12 +128,17 @@ remain symbolic whenever an exact simplification is unavailable.
 
 ## Tests and performance measurements
 
-The core tests compare randomized arithmetic against independent `BigRational`
-calculations, decode randomized binary64 inputs independently, check promotion
-and cancellation, exercise every domain and resource error, force hash
-collisions, and verify round trips and context lifetimes. A separate allocator
-test verifies zero allocations for the common inline operations and for repeated
-construction of live interned sin and cos nodes.
+The 37 core tests compare randomized machine and large-rational arithmetic
+against independent `BigRational` calculations. They also check binary64 pairs
+and power-of-two scaling against an independent exact oracle, promotion and
+cancellation, trig periods and signs, power grouping and exponent overflow,
+partial domains, resource limits, forced hash collisions, exact text round trips,
+malformed Unicode input, and interner capacity and lifetimes.
+
+A separate allocator test verifies zero allocations for the common inline
+operations, binary64 negation and halving, addition of minimum subnormals,
+symbolic term cancellation, small decimal parsing, hashing large coefficients,
+and repeated construction of live interned sin and cos nodes.
 
 Run the standalone microbenchmarks with:
 
@@ -133,25 +147,41 @@ cargo run --release --example symbolic_angle_bench
 ```
 
 These measurements used an Apple M3, ARM64, Rust 1.98.1, and the release profile.
-Each entry is the median of seven samples with 100,000 operations per sample;
-the larger rational case uses 10,000. The existing implementation at main commit
-`06d6241` is measured in the same executable. Inputs in the comparison produce the
-same literal results, although the existing API generally uses projective
-rotation semantics.
+The baseline is the standalone core at commit `163aa1b`. Both binaries use the
+same expanded benchmark harness. Three pairs of complete runs alternate which
+binary runs first. Each run reports the median of seven samples with 100,000
+operations per sample; the larger rational case uses 10,000. The table reports
+the median of those three run medians.
 
-| Operation | Symbolic core ns/op | Existing Angle ns/op |
-| --- | ---: | ---: |
-| Construct pi/7 | 25.36 | 50.66 |
-| Add pi/7 and 2pi/7 | 15.55 | 98.97 |
-| Add pi/4 and 2pi/4 | 10.49 | 7.44 |
-| Classify pi/4 as a quarter turn | 0.67 | 3.50 |
-| Add binary64 0.25 and 0.5 exactly | 24.44 | 16.87 |
-| Reconstruct live sin(pi/7) | 13.59 | — |
-| Cancel a symbolic term with its negative | 84.22 | — |
-| Construct and drop sin(1/3) | 62.88 | — |
-| Add one to a 336-bit rational | 2370.66 | — |
+| Operation | Before ns/op | After ns/op | Speedup |
+| --- | ---: | ---: | ---: |
+| Construct pi/7 | 12.75 | 12.75 | 1.00× |
+| Add pi/7 and 2pi/7 | 15.27 | 14.52 | 1.05× |
+| Add pi/4 and 2pi/4 | 13.08 | 12.83 | 1.02× |
+| Classify pi/4 as a quarter turn | 0.85 | 0.96 | 0.89× |
+| Add binary64 0.25 and 0.5 exactly | 31.03 | 16.13 | 1.92× |
+| Reconstruct live sin(pi/7) | 17.00 | 17.88 | 0.95× |
+| Cancel a symbolic term with its negative | 107.41 | 14.28 | 7.52× |
+| Construct and drop sin(1/3) | 79.51 | 74.76 | 1.06× |
+| Add one to a 336-bit rational | 3030.87 | 159.85 | 18.96× |
+| Negate binary64 0.1 | 158.69 | 11.19 | 14.18× |
+| Halve binary64 0.1 | 169.52 | 15.58 | 10.88× |
+| Add minimum subnormals | 963.98 | 15.05 | 64.05× |
+| Parse decimal 0.125 | 255.61 | 38.28 | 6.68× |
+| Parse sin(pi/7) with its node cached | 359.11 | 131.74 | 2.73× |
+| Hash a 336-bit coefficient | 87.41 | 4.99 | 17.52× |
 
-The core improves general pi arithmetic and classification in this measurement.
-The existing specialized quarter-turn addition and binary64 addition remain
-faster. These timings describe scalar operations on one machine; circuit
-performance requires separate measurements when integration is implemented.
+The largest gains come from retaining exact dyadic results inline, avoiding
+coefficient division while hashing and comparing, and adding an integer to a
+large reduced rational without reducing it again. Simple symbolic cancellation
+and machine decimal parsing also avoid temporary allocations.
+
+Small differences in unchanged operations should be interpreted alongside
+machine variation: the unchanged legacy quarter-turn classification also moved from
+4.35 to 4.97 ns/op between the paired binaries. The current core's cached-function
+hit takes 17.88 ns/op. For comparison, the unchanged gate Angle's specialized
+quarter-turn addition takes 10.00 ns/op versus 12.83 for this core; its binary64
+addition takes 22.38 ns/op versus 16.13 for this core.
+
+These timings describe scalar operations on one machine. Circuit performance
+requires separate measurements when integration is implemented.
