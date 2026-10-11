@@ -906,10 +906,11 @@ fn main() {
     } else {
         optimize_with(&parsed.circuit, &run.options, &observer).unwrap_or_else(|e| arg_error(e))
     };
-    if report.numerical.uncertified_syntheses != 0 {
+    if report.numerical.certified_syntheses != 0 {
+        let count = report.numerical.certified_syntheses;
+        let noun = if count == 1 { "gate" } else { "gates" };
         ui.note(&format!(
-            "{} Rz syntheses used numeric targets; epsilon applies per rotation, and total conversion and circuit error are uncertified",
-            report.numerical.uncertified_syntheses
+            "{count} rotation {noun} certified against accepted angles; epsilon applies per input gate; summed bound covers synthesis only"
         ));
     }
     let pbc = finish(ui, &report, &result, &run, start);

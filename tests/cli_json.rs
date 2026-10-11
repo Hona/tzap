@@ -111,7 +111,7 @@ fn assert_schema(report: &Json, context: &str) {
         numerical
             .get("synthesis_error_scope")
             .as_str()
-            .contains("uncertified")
+            .contains("accepted_angle_per_input_gate")
     );
 
     let options = report.get("options");
@@ -791,19 +791,24 @@ fn preserved_expression_warns_and_reports_its_input_policy() {
 }
 
 #[test]
-fn explicit_synthesis_reports_uncertified_error_in_both_streams() {
+fn explicit_synthesis_reports_certified_error_in_both_streams() {
     let run = Tzap::new(&["-", "--passes", "DecomposeRz", "--json"])
         .stdin("qreg q[1]; rz(pi/7) q[0];")
         .run()
         .ok("explicit approximate synthesis");
-    assert!(run.stderr.contains("1 Rz syntheses used numeric targets"));
-    assert!(run.stderr.contains("circuit error are uncertified"));
+    assert!(
+        run.stderr
+            .contains("1 rotation gate certified against accepted angles")
+    );
+    assert!(run.stderr.contains("summed bound covers synthesis only"));
     let report = Json::parse(&run.stdout);
-    assert_eq!(report.at("numerical/uncertified_syntheses").as_usize(), 1);
+    assert_eq!(report.at("numerical/uncertified_syntheses").as_usize(), 0);
+    assert_eq!(report.at("numerical/certified_syntheses").as_usize(), 1);
+    assert!(report.at("numerical/certified_error_bound").as_f64() >= 1e-10);
     assert!(
         report
             .at("numerical/synthesis_error_scope")
             .as_str()
-            .contains("uncertified")
+            .contains("accepted_angle_per_input_gate")
     );
 }

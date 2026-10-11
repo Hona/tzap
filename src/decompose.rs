@@ -8,8 +8,6 @@ use std::sync::Mutex;
 
 use crate::circuit::{Circuit, Gate, Qubit};
 use crate::pass::Pass;
-use rsgridsynth::config::config_from_theta_epsilon;
-use rsgridsynth::gridsynth::gridsynth_gates;
 
 // --- Toffoli decomposition --------------------------------------------------
 
@@ -157,14 +155,27 @@ impl std::fmt::Display for SynthesisError {
 }
 impl std::error::Error for SynthesisError {}
 impl DecomposeRotations {
-    /// Explicit approximate synthesis. The epsilon applies to gridsynth's
-    /// numeric target, not to conversion error or the whole circuit.
+    /// Certified approximate synthesis. Epsilon bounds projective spectral
+    /// error per input gate, including target conversion and reduction.
     pub fn try_run(&self, circuit: &Circuit) -> Result<Circuit, SynthesisError> {
         let epsilon = self.epsilon;
         if !epsilon.is_finite() || epsilon <= 0.0 {
             return Err(SynthesisError(
-                "Rz synthesis epsilon must be positive and finite".into(),
+                "rotation synthesis epsilon must be positive and finite".into(),
             ));
+        }
+        for (index, gate) in circuit.gates.iter().enumerate() {
+            let (len, mut operands) = crate::circuit::qubit_operands(gate);
+            let operands = &mut operands[..len];
+            operands.sort_unstable();
+            if operands.iter().any(|q| *q as usize >= circuit.num_qubits)
+                || operands.windows(2).any(|pair| pair[0] == pair[1])
+                || matches!(gate, Gate::measure { cbit, .. } if *cbit as usize >= circuit.num_cbits)
+            {
+                return Err(SynthesisError(format!(
+                    "gate {index}: invalid circuit operand"
+                )));
+            }
         }
         let _batch_guard = GRIDSYNTH_BATCH_LOCK
             .lock()
@@ -174,26 +185,58 @@ impl DecomposeRotations {
         let expanded: Result<Vec<Vec<Gate>>, SynthesisError> = circuit
             .gates
             .iter()
-            .map(|gate| {
-                if let Some(terms) = expand_controlled_rotation(gate)? {
-                    let count = terms
-                        .iter()
-                        .filter(|g| matches!(g, Gate::rz(..) | Gate::p(..)))
-                        .count();
-                    let term_epsilon = epsilon / count as f64;
-                    if term_epsilon == 0.0 {
-                        return Err(SynthesisError(
-                            "rotation synthesis epsilon underflows when split across terms".into(),
-                        ));
+            .enumerate()
+            .map(|(index, gate)| {
+                let result = (|| {
+                    if let Some(terms) = expand_controlled_rotation(gate)? {
+                        let count = terms
+                            .iter()
+                            .filter(|g| matches!(g, Gate::rz(..) | Gate::p(..)))
+                            .count();
+                        let approximate = terms
+                            .iter()
+                            .any(|g| g.angle().is_some_and(|a| a.quarter_turns().is_none()));
+                        let term_epsilon = if approximate {
+                            (epsilon / (4 * count) as f64).next_down()
+                        } else {
+                            epsilon
+                        };
+                        if term_epsilon <= 0.0 {
+                            return Err(SynthesisError(
+                                "rotation synthesis epsilon underflows when split across terms"
+                                    .into(),
+                            ));
+                        }
+                        let groups = terms
+                            .iter()
+                            .map(|g| synthesize_single_rotation(g, term_epsilon))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(|groups| groups.into_iter().flatten().collect::<Vec<_>>())?;
+                        if approximate {
+                            crate::synthesis::verify_controlled(gate, &groups, epsilon)
+                                .map_err(|e| SynthesisError(e.to_string()))?;
+                        }
+                        Ok((groups, approximate))
+                    } else {
+                        synthesize_single_rotation(gate, epsilon).map(|gates| {
+                            (
+                                gates,
+                                gate.angle().is_some_and(|a| a.quarter_turns().is_none()),
+                            )
+                        })
                     }
-                    terms
-                        .iter()
-                        .map(|g| synthesize_single_rotation(g, term_epsilon))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|groups| groups.into_iter().flatten().collect())
-                } else {
-                    synthesize_single_rotation(gate, epsilon)
-                }
+                })();
+                result
+                    .map(|(gates, approximate)| {
+                        if approximate {
+                            crate::angle_stats::certified_synthesis(epsilon);
+                        }
+                        gates
+                    })
+                    .map_err(|e: SynthesisError| {
+                        crate::angle_stats::certification_failure();
+                        SynthesisError(format!("gate {index}, epsilon {epsilon}: {e}"))
+                    })
             })
             .collect();
 
@@ -280,11 +323,9 @@ fn synthesize_single_rotation(gate: &Gate, epsilon: f64) -> Result<Vec<Gate>, Sy
     if theta.quarter_turns().is_some() {
         gates.extend(theta.rotation_gates(q));
     } else {
-        let numeric = theta
-            .to_f64_lossy()
+        let word = crate::synthesis::synthesize(theta, epsilon)
             .map_err(|e| SynthesisError(e.to_string()))?;
-        crate::angle_stats::synthesis();
-        for c in synthesize_rz(numeric, epsilon) {
+        for c in word {
             match c {
                 'H' => gates.push(Gate::h(q)),
                 'T' => gates.push(Gate::t(q)),
@@ -302,33 +343,6 @@ fn synthesize_single_rotation(gate: &Gate, epsilon: f64) -> Result<Vec<Gate>, Sy
         gates.push(Gate::s(q));
     }
     Ok(gates)
-}
-
-fn synthesize_rz(theta: f64, epsilon: f64) -> Vec<char> {
-    // The dependency subtracts unsigned decimal exponents when configuring
-    // precision. A looser request can safely use the stricter bound of one.
-    let epsilon = epsilon.min(1.0);
-    let mut config =
-        config_from_theta_epsilon(bounded_synthesis_angle(theta), epsilon, 0, false, true);
-    let result = gridsynth_gates(&mut config);
-    result.gates.chars().collect()
-}
-
-fn bounded_synthesis_angle(theta: f64) -> f64 {
-    // Preserve ordinary synthesis, including literal 2pi and 4pi rotations.
-    // Beyond this modest interval the dependency's fixed working precision
-    // cannot reliably reduce large arguments, and its decimal conversion can
-    // change the phase of a binary64 angle by an arbitrarily large amount.
-    if theta.abs() <= 2.0 * std::f64::consts::TAU {
-        return theta;
-    }
-    // These are the same eigenphases used by the native Rz reference matrix.
-    // Unlike remainder with a rounded 2pi, native sin_cos performs argument
-    // reduction before atan2 returns a bounded phase in [-pi, pi]. This occurs
-    // only after controlled gates have expanded into unconditional rotations;
-    // any discarded synthesis phase therefore remains whole-circuit global.
-    let (sin, cos) = (theta / 2.0).sin_cos();
-    2.0 * sin.atan2(cos)
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -936,30 +950,6 @@ mod tests {
             maximum = maximum.max(error);
         }
         maximum
-    }
-
-    #[test]
-    fn bounded_synthesis_preserves_ordinary_angles_and_large_native_eigenphases() {
-        let limit = 2.0 * std::f64::consts::TAU;
-        for theta in [-limit, -7.31, -PI, -0.0, 0.0, PI, 7.31, limit] {
-            assert_eq!(bounded_synthesis_angle(theta).to_bits(), theta.to_bits());
-        }
-        for theta in [
-            f64::from_bits(limit.to_bits() + 1),
-            1e16,
-            1e20,
-            1e30,
-            f64::MAX,
-        ] {
-            for theta in [theta, -theta] {
-                let reduced = bounded_synthesis_angle(theta);
-                assert!(reduced.is_finite() && reduced.abs() <= std::f64::consts::TAU);
-                let (old_sin, old_cos) = (theta / 2.0).sin_cos();
-                let (new_sin, new_cos) = (reduced / 2.0).sin_cos();
-                assert!((new_sin - old_sin).abs() < 1e-15);
-                assert!((new_cos - old_cos).abs() < 1e-15);
-            }
-        }
     }
 
     #[test]

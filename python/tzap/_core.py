@@ -35,10 +35,13 @@ class NumericalReport:
     skipped_coefficient_limit_folds: int
     uncertified_syntheses: int
     randomized_matching: bool
+    certified_syntheses: int = 0
+    failed_certifications: int = 0
+    certified_error_bound: float | None = 0.0
     input_policy: str = "accepted_angles"
     folding: str = "no_added_rounding"
     synthesis_error_scope: str = (
-        "numeric_target_per_rotation; total_conversion_and_circuit_error_uncertified"
+        "accepted_angle_per_input_gate; summed_bound_covers_synthesis_only"
     )
 
 

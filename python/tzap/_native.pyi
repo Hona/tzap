@@ -33,6 +33,6 @@ def _optimize_qasm(
         tuple[int, int, int, int, int],
         tuple[int, int, int, int, int],
         tuple[int, int, int, int, int],
-        tuple[int, int, int, int, int, int, bool],
+        tuple[int, int, int, int, int, int, bool, int, int, float | None],
     ],
 ]: ...

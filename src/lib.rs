@@ -15,6 +15,7 @@ pub mod phase_fold_pauli;
 pub mod phase_fold_rand;
 pub mod qasm;
 pub mod super_opt;
+mod synthesis;
 
 #[cfg(feature = "python")]
 mod python;

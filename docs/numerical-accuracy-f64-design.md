@@ -1,6 +1,6 @@
 # Numerical accuracy without further angle representation changes
 
-Status: proposed design. Baseline: `main` at
+Status: core implemented on this branch. Baseline: `main` at
 `06d62413a73882806ab560b70237f62d1d7e76b0`. Date: 2026-10-10.
 
 ## Decision
@@ -636,3 +636,75 @@ This adaptation cannot recover mathematical pi provenance already lost during
 parsing. It can prevent optimization from adding further numerical error.
 Latest `main` already preserves more provenance with `Angle`; no part of this
 design requires removing that support.
+
+## Implementation on this branch
+
+The certified path is the default. It uses a pure Rust backend: integer
+fixed-point intervals with outward-rounded division, Machin's formula for pi,
+and Taylor polynomials with explicit remainder bounds. Accepted floats are
+decoded from their bits. The candidate word is evaluated exactly in
+`Z[omega]/sqrt(2)^k` with temporary big integers, then converted to intervals
+once. Complete controlled operators receive an additional matrix certificate.
+This avoids interval widening through every intermediate gate multiplication.
+
+The verifier bounds the Frobenius norm, which upper-bounds the requested
+projective spectral norm. Controlled terms initially receive `epsilon/(4*n)`
+with a downward-rounded split; the final complete operator must still pass
+against the input gate's epsilon. Named-only lowering skips that numerical
+budget. Repeated unconditional targets reuse a bounded cache of 64 previously
+verified words, keyed by literal accepted angle and identical epsilon.
+
+Limits are 2,048 interval bits, 8,192 instructions per candidate word, and three
+candidate attempts. Approximate terms require epsilon at least `1e-80`; tighter
+controlled-term budgets can hit this limit before the input epsilon does. A
+limit or failed verification returns a typed internal failure, displayed through
+the existing public synthesis error with the input gate index and epsilon.
+There is no fallback to uncertified synthesis.
+
+Existing folding safeguards remain in place. TwoSum now has an additional
+allocation-free integer check of the exact binary sum. Numeric zero recognition
+and half-angle representability also use bits, and signed arithmetic avoids
+floating multiplication by a sign. Public angle payloads and gate layout are
+unchanged.
+
+Rust, JSON, and Python reports expose certified input-gate counts, failed
+certification counts, and the outward-rounded sum of synthesized input-gate
+bounds. The sum covers synthesis only; parser input interpretation and unchecked
+randomized matching remain separate.
+
+Regression inputs include the investigation's large-angle, tiny-angle,
+near-Clifford, overflow, mixed named/numeric, controlled-phase, and rational
+coefficient examples. The full repeated circuits contain 400,000 gates for the
+Rz/Y example and 600,000 gates for the P/X example. They run as explicit release
+stress tests; smaller versions also run in the normal suite. The independent
+rational phase interpreter is shared with the numerical stress fuzzer.
+
+Strict mathematical source evaluation and temporary unrepresentable controlled
+half-angle plans remain the separate future extensions described above.
+
+### Validation results
+
+The full Rust suite and Python suite pass. Python reports 208 passed and one
+skipped. The release stress run also passes all 2,048 seeded numerical-fuzz
+circuits and both full repeated-circuit regressions. The arithmetic guard tests
+exercise flushed and directed-rounded candidate results without changing the
+floating-point environment of other test threads. Python lint, formatting, and
+native stub checks pass. Strict Clippy still reports existing warnings in older
+modules; the new synthesis modules introduce none.
+
+A local release CLI smoke benchmark used one run per input, with parsing and
+process startup included. These figures are observations on the development
+machine, not a comparison against `main` or a performance guarantee. Exact
+folding used only `PhaseFoldPauli`; synthesis used only `DecomposeRotations`.
+
+| Input | Output gates | Refused rounded folds | Wall time | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 50,000 pairs of T and Tdg | 0 | 0 | 0.029 s | 19.0 MiB |
+| 100,000 repetitions of `rz(0.125)` | 1 | 0 | 0.043 s | 30.3 MiB |
+| 50,000 pairs of `rz(0.1); rz(0.2)` | 100,000 | 99,999 | 0.037 s | 25.4 MiB |
+| `rz(1e16)`, epsilon `1e-20` | 532 | 0 | 0.048 s | 4.1 MiB |
+
+The final row has one certified input gate and an outward-rounded synthesis
+bound of `1.0000000000000001e-20`. Named and numeric exact-folding cases have
+zero synthesis error budget. Precision and retry counts are currently internal
+resource controls; they are not exposed as public report fields.

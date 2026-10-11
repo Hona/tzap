@@ -144,7 +144,7 @@ CCX/CCZ, CZ, or Rz decomposition.
 | `decompose_rz` | `false` | Compatibility alias for `decompose_rotations` |
 | `decompose_cz` | `false` | Decompose CZ into H+CX+H before optimizing |
 | `decompose_ccx` | `false` | Decompose CCX and CCZ into Clifford+T |
-| `rz_epsilon` | `1e-10` | Per-input-gate numeric-target epsilon for rotation decomposition |
+| `rz_epsilon` | `1e-10` | Certified per-input-gate spectral error for rotation decomposition |
 | `parallel` | `false` | Optimize gate-contiguous chunks concurrently, then concatenate |
 | `superopt` | all `None` | Per-run overrides for the SuperOpt window/MURM bounds |
 | `superopt_gates` | `Auto` | Base MURM basis plus native CZ/CCX/CCZ gates present in the current stage |
@@ -157,29 +157,43 @@ again when a decomposition changed the circuit.
 
 `Report::numerical` records preserved expressions, numeric input fallback,
 skipped rounded/nonfinite/coefficient-limit folds, randomized matching, and
-uncertified synthesis calls. The guarantee starts at accepted angles, rather
+certified synthesis calls, certification failures, and an outward-rounded sum
+of certified synthesis bounds. The guarantee starts at accepted angles, rather
 than ideal real source-expression semantics. `PhaseFoldRand` still uses
 unchecked randomized Boolean-function matches; its collision guarantee is
 separate from exact angle arithmetic. An explicit pipeline omitting that pass
 can use deterministic matching.
 
-Explicit `DecomposeRotations` requests permit approximation. Its per-rotation epsilon
-belongs to the numeric target passed to gridsynth; total conversion error and
-whole-circuit error are uncertified. `DecomposeRotations::try_run` and the optimization
-driver return a structured synthesis error for inputs that cannot be converted.
-The infallible `Pass` adapter conservatively returns the original circuit on a
-synthesis error; callers requiring synthesis must use `try_run` or the driver.
-Certified quarter-turns lower exactly before synthesis, SuperOpt, or PBC.
-Other parametric gates remain outside SuperOpt's exact matrix domain.
+Explicit `DecomposeRotations` requests permit approximation. Epsilon bounds
+projective spectral error against each accepted input gate, including target
+conversion and argument reduction. Temporary integer intervals prepare the
+mathematical target, and an independent verifier checks each proposed Clifford+T
+word. Approximation introduces no new persistent angle representation.
+`DecomposeRotations::try_run` and the optimization driver return a synthesis
+error, including the input gate index and epsilon, when certification cannot
+succeed. The infallible `Pass` adapter returns the original circuit on error;
+callers requiring synthesis must use `try_run` or the driver. Certified
+quarter-turns lower exactly before synthesis, SuperOpt, or PBC. Other parametric
+gates remain outside SuperOpt's exact matrix domain.
 
 Controlled rotations expand into unconditional half-angle rotations and two
-CNOTs before synthesis. CP also needs P(lambda/2) on the control; it differs
-from CRZ. Half-angles use checked arithmetic without projective normalization:
-unrepresentable halves produce a synthesis error. Each controlled rotation
-splits its epsilon between two numeric targets; CP uses three. Discarded
-synthesis phases are therefore whole-circuit global phases. Large numeric
-angles use bounded native eigenphases for synthesis; this conversion remains
-uncertified, as does total circuit error.
+CNOTs before synthesis. CP also needs P(lambda/2) on the control. Half-angles use
+checked literal arithmetic; unrepresentable halves produce an error. Numerical
+terms share a conservative fraction of the input gate's budget, and the complete
+two-qubit operator is independently verified, including the inactive-control
+subspace. Large angles use enclosing mathematical-pi reduction, without native
+binary64 trigonometry or floating remainders.
+
+The initial implementation limits interval precision to 2,048 bits, candidate
+words to 8,192 instructions, and candidate attempts to three. Approximate terms
+require epsilon at least `1e-80`; a controlled gate's tighter term budgets can
+reach that limit earlier. Exact lowering does not need a numeric budget. Requests
+outside the supported limits return an error instead of unverified output.
+`Report::numerical.certified_error_bound` is an outward-rounded sum of bounds
+for synthesized input gates (`None` if the sum overflows). It covers synthesis
+only; it does not certify parser mathematical source semantics or unchecked
+randomized matching. `uncertified_syntheses` remains available for compatibility
+and is zero in the certified path.
 
 Y, SX, SWAP, CY, CH, and CSWAP have exact input matrices for SuperOpt; its
 synthesis basis remains unchanged. PBC rejects these native gates, as well as
