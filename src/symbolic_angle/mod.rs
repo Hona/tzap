@@ -717,3 +717,6 @@ mod regression_tests;
 
 #[cfg(test)]
 mod pass_tests;
+
+#[cfg(test)]
+mod stress_tests;

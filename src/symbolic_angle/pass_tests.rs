@@ -28,13 +28,26 @@ fn scalar(a: &Angle, scale: &R, out: &mut Phase) {
         ExpressionRef::Product {
             coefficient,
             factors,
-        } if factors.len() == 1 => {
-            scalar(&factors[0], &(scale * coefficient.to_big_rational()), out)
+        } => {
+            let scale = scale * coefficient.to_big_rational();
+            if factors.len() == 1 {
+                scalar(&factors[0], &scale, out);
+            } else {
+                let key = format!(
+                    "product({})",
+                    factors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("*")
+                );
+                *out.entry(key).or_default() += scale;
+            }
         }
         _ => *out.entry(a.to_string()).or_default() += scale,
     }
 }
-fn signatures(c: &Circuit) -> Vec<(usize, Phase)> {
+pub(super) fn signatures(c: &Circuit) -> Vec<(usize, Phase)> {
     let mut result = Vec::new();
     for input in 0..1usize << c.num_qubits {
         let mut bits = input;
@@ -91,7 +104,7 @@ fn signatures(c: &Circuit) -> Vec<(usize, Phase)> {
     }
     result
 }
-fn passes() -> Vec<Box<dyn Pass>> {
+pub(super) fn passes() -> Vec<Box<dyn Pass>> {
     vec![
         Box::new(CancelGates),
         Box::new(PhaseFoldRand),

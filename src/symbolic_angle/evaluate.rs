@@ -304,9 +304,12 @@ mod tests {
         R::new(n.clone(), ctx.unit.clone())
     }
     fn check(source: &str, lower: R, upper: R) {
+        check_at_precision(source, lower, upper, 192);
+    }
+    fn check_at_precision(source: &str, lower: R, upper: R, bits: usize) {
         let mut ctx = super::super::AngleContext::default();
         let a = ctx.parse(source).unwrap();
-        let precision = Context::new(192);
+        let precision = Context::new(bits);
         let result = enclose(&a, &precision).unwrap();
         assert!(
             endpoint(&result.lo, &precision) <= lower,
@@ -378,6 +381,52 @@ mod tests {
         }
         let (lo, hi) = logarithm(q(2, 1));
         check("ln(1/2)", -hi, -lo);
+    }
+
+    #[test]
+    #[ignore = "extended independent rational-series oracle for certified functions"]
+    fn certified_function_stress() {
+        let cases = std::env::var("SYMBOLIC_ENCLOSURE_CASES")
+            .map(|s| s.parse::<usize>().expect("decimal case count"))
+            .unwrap_or(64);
+        let mut seed = 0x656e_636c_6f73_7572u64;
+        for case in 0..cases {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let n = (seed >> 32) as i64 % 256 + 1;
+            let x = q(n, 257);
+            let bits = [96, 192, 384][case % 3];
+            let (slo, shi) = trig(x.clone(), true);
+            let (clo, chi) = trig(x.clone(), false);
+            check_at_precision(&format!("sin({n}/257)"), slo.clone(), shi.clone(), bits);
+            check_at_precision(&format!("sin(-{n}/257)"), -shi.clone(), -slo.clone(), bits);
+            check_at_precision(&format!("cos({n}/257)"), clo.clone(), chi.clone(), bits);
+            check_at_precision(&format!("tan({n}/257)"), &slo / &chi, &shi / &clo, bits);
+            let (lo, hi) = exponential(x.clone());
+            check_at_precision(&format!("exp({n}/257)"), lo.clone(), hi.clone(), bits);
+            check_at_precision(&format!("exp(-{n}/257)"), q(1, 1) / hi, q(1, 1) / lo, bits);
+            let (lo, hi) = logarithm(q(1, 1) + &x);
+            check_at_precision(
+                &format!("ln({}/257)", n + 257),
+                lo.clone(),
+                hi.clone(),
+                bits,
+            );
+            check_at_precision(&format!("ln(257/{})", n + 257), -hi, -lo, bits);
+            let a = super::super::AngleContext::default()
+                .parse(&format!("sqrt({n}/257)"))
+                .unwrap();
+            let ctx = Context::new(bits);
+            let result = enclose(&a, &ctx).unwrap();
+            let lo = endpoint(&result.lo, &ctx);
+            let hi = endpoint(&result.hi, &ctx);
+            assert!(&lo * &lo <= x && &hi * &hi >= x, "sqrt case={case}");
+        }
+        eprintln!(
+            "certified function stress: {} rational-reference enclosures passed at 96/192/384 bits",
+            cases * 9
+        );
     }
     #[test]
     fn rational_sums_products_divisions_and_powers_enclose_literal_values() {
