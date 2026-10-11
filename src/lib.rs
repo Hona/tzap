@@ -3,6 +3,7 @@
 pub mod angle;
 mod angle_expr;
 pub mod angle_stats;
+pub mod symbolic_angle;
 
 pub mod cancel;
 pub mod circuit;
