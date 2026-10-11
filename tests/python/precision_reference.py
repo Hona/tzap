@@ -21,6 +21,8 @@ class PiMultiple:
 def binary(value):
     if isinstance(value, PiMultiple):
         return MP.pi * value.coefficient.numerator / value.coefficient.denominator
+    if isinstance(value, MP.mpf):
+        return value
     numerator, denominator = float(value).as_integer_ratio()
     return MP.mpf(numerator) / denominator
 
