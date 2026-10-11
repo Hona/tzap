@@ -5,9 +5,17 @@ tzap. Keep arithmetic and optimization exact; evaluate expressions numerically
 only at explicit synthesis, numeric export, or diagnostic boundaries. Preserve
 the speed of the common Clifford+T and finite numeric input paths.
 
-This is a proposed implementation sequence. Circuit and pass integration has not
-started. The baseline is main at `f29e728`, merged into `codex/symbolic-angle`,
-plus the standalone core and performance work in `163aa1b` and `016cf02`.
+Preparatory integration adapters are implemented; circuit storage and passes
+still use the legacy angle. The baseline is main at `f29e728`, merged into
+`codex/symbolic-angle`, plus the standalone core and performance work in
+`163aa1b` and `016cf02`. The remaining stages below are proposed work.
+
+Step 1 now provides gate semantics and lowering with an explicit scalar global
+phase, exact legacy affine conversion, a borrowed internal expression view, and
+a bounded sparse phase accumulator. Regression fixtures cover all eight native
+angle families, synthesis, SDK export, and serial and parallel optimization.
+See [the core documentation](symbolic-angle-core.md#integration-adapters) for API
+contracts and [the measured baseline](symbolic-angle-integration-baseline.md).
 
 ## Existing implementation
 
@@ -333,7 +341,7 @@ operations state their semantics; source and output policies are explicit; and
 synthesis and certified numeric export verify the full original expression.
 Existing discrete SuperOpt and PBC representations remain specialized.
 
-The first implementation change should be step 1: baseline fixtures, gate
-semantics, and accumulation adapters. Complete certified evaluation before the
-atomic circuit storage switch so the migration preserves main's synthesis and
-SDK guarantees from its first usable commit.
+The next implementation change is step 2: reusable certified evaluation of the
+full scalar expression. Complete it before the atomic circuit storage switch so
+the migration preserves main's synthesis and SDK guarantees from its first
+usable commit.

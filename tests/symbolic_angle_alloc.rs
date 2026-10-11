@@ -5,7 +5,10 @@ use std::{
     hint::black_box,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use tzap::symbolic_angle::{Angle, AngleContext, RotationPeriod};
+use tzap::symbolic_angle::{
+    Angle, AngleContext, PhaseAccumulator, RotationPeriod,
+    integration::{GateFamily, GateSemantics, Operands, Scope, from_legacy},
+};
 struct CountingAllocator;
 static MEASURING: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -89,4 +92,43 @@ fn hot_scalar_paths_and_live_interned_functions_allocate_nothing() {
     );
     assert!(ctx.sin(&a).unwrap().shares_storage(&live_sin));
     assert!(ctx.cos(&a).unwrap().shares_storage(&live_cos));
+    let mut accumulator = PhaseAccumulator::new(RotationPeriod::TwoPi, ctx.limits());
+    let legacy = tzap::angle::Angle::from_f64(0.125).unwrap();
+    let literal = GateSemantics {
+        family: GateFamily::Ry,
+        scope: Scope::Literal,
+    };
+    let controlled = GateSemantics {
+        family: GateFamily::Crx,
+        scope: Scope::ProjectiveCircuit,
+    };
+    let two_pi = ctx.pi_fraction(2, 1).unwrap();
+    assert_eq!(
+        allocations(|| {
+            for _ in 0..100 {
+                accumulator.add_quarters(1).unwrap();
+                accumulator.add_quarters(-1).unwrap();
+                black_box(accumulator.finish(&mut ctx).unwrap());
+                black_box(
+                    literal
+                        .lower(&mut ctx, &quarter, Operands::Single(0))
+                        .unwrap(),
+                );
+                black_box(
+                    controlled
+                        .lower(
+                            &mut ctx,
+                            &two_pi,
+                            Operands::Controlled {
+                                control: 1,
+                                target: 0,
+                            },
+                        )
+                        .unwrap(),
+                );
+                black_box(from_legacy(&mut ctx, &legacy).unwrap());
+            }
+        }),
+        0
+    );
 }

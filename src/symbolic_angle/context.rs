@@ -419,7 +419,7 @@ impl AngleContext {
         self.terms(b, &Rational::ONE, &mut terms, budget)?;
         self.sum(terms, budget)
     }
-    fn terms(
+    pub(super) fn terms(
         &mut self,
         a: &Angle,
         scale: &Rational,
@@ -479,7 +479,11 @@ impl AngleContext {
         }
         Ok(())
     }
-    fn sum(&mut self, mut terms: Vec<Term>, budget: &mut Budget) -> Result<Angle, Error> {
+    pub(super) fn sum(
+        &mut self,
+        mut terms: Vec<Term>,
+        budget: &mut Budget,
+    ) -> Result<Angle, Error> {
         self.sort_budget(
             terms.len(),
             terms.iter().map(|t| t.atom.expression_nodes()).sum(),

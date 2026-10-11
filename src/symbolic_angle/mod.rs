@@ -15,11 +15,15 @@
 //! # Ok::<(), tzap::symbolic_angle::Error>(())
 //! ```
 
+mod accumulate;
 mod context;
 mod dyadic;
+pub mod integration;
 mod parse;
 mod rational;
+pub(crate) mod view;
 
+pub use accumulate::PhaseAccumulator;
 pub use context::{AngleContext, InternerStats};
 pub use rational::Rational;
 
@@ -577,38 +581,33 @@ fn node_hash(kind: &NodeKind) -> u64 {
 }
 impl fmt::Display for Angle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            Value::Rational { .. } | Value::Dyadic(_) => {
-                write!(f, "{}", self.as_rational().unwrap())
+        use view::ExpressionRef;
+        match self.expression() {
+            ExpressionRef::Rational(r) => write!(f, "{r}"),
+            ExpressionRef::Pi(r) => write!(f, "({r}*pi)"),
+            ExpressionRef::Sum(terms) => {
+                f.write_str("(")?;
+                for (i, (coefficient, atom)) in terms.enumerate() {
+                    if i != 0 {
+                        f.write_str("+")?;
+                    }
+                    write!(f, "({coefficient}*{atom})")?;
+                }
+                f.write_str(")")
             }
-            Value::Pi { .. } => write!(f, "({}*pi)", self.pi_coefficient().unwrap()),
-            Value::Shared(node) => match &node.kind {
-                NodeKind::Rational(r) => write!(f, "{r}"),
-                NodeKind::Pi(r) => write!(f, "({r}*pi)"),
-                NodeKind::Sum(terms) => {
-                    f.write_str("(")?;
-                    for (i, term) in terms.iter().enumerate() {
-                        if i != 0 {
-                            f.write_str("+")?;
-                        }
-                        write!(f, "({}*{})", term.coefficient, term.atom)?;
-                    }
-                    f.write_str(")")
+            ExpressionRef::Product {
+                coefficient,
+                factors,
+            } => {
+                write!(f, "({coefficient}")?;
+                for factor in factors {
+                    write!(f, "*{factor}")?;
                 }
-                NodeKind::Product {
-                    coefficient,
-                    factors,
-                } => {
-                    write!(f, "({coefficient}")?;
-                    for factor in factors {
-                        write!(f, "*{factor}")?;
-                    }
-                    f.write_str(")")
-                }
-                NodeKind::Quotient(a, b) => write!(f, "({a}/{b})"),
-                NodeKind::Power(a, e) => write!(f, "({a}^{e})"),
-                NodeKind::Function(fun, a) => write!(f, "{}({a})", fun.name()),
-            },
+                f.write_str(")")
+            }
+            ExpressionRef::Quotient(a, b) => write!(f, "({a}/{b})"),
+            ExpressionRef::Power(a, e) => write!(f, "({a}^{e})"),
+            ExpressionRef::Function(fun, a) => write!(f, "{}({a})", fun.name()),
         }
     }
 }

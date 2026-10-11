@@ -126,6 +126,58 @@ Certified numerical evaluation, arbitrary-precision trig evaluation, synthesis,
 and runtime circuit integration are future layers. Function values currently
 remain symbolic whenever an exact simplification is unavailable.
 
+## Integration adapters
+
+`symbolic_angle::integration` prepares gate integration without changing existing
+circuit storage or pass behavior. `GateSemantics` requires a `GateFamily` and
+`Scope`: literal operators use a `4*pi` period for RX/RY/RZ, while executed
+circuits up to global phase may use `2*pi`. Controlled RX/RY/RZ always use
+`4*pi`; P and CP use `2*pi`. Identity and inverse queries return proofs, never
+tolerance-based decisions.
+
+`GateSemantics::lower` returns `None` outside its supported named-gate fragment.
+It supports all single-qubit quarter turns and controlled even quarter turns.
+Its `Lowering` contains a stack-backed named-gate word and an exact scalar
+`global_phase`, with the contract
+`original = exp(i * global_phase) * word`. The phase is retained in both scopes;
+only callers operating on projective circuits may discard it. Invalid operand
+shapes and coincident control and target wires return errors. Operand range
+checks belong to the circuit consumer. This adapter does not create or optimize
+reusable gate bodies.
+
+`integration::from_legacy` preserves the old angle's literal pi coefficient and
+the exact dyadic residual. It rejects opaque preserved expressions rather than
+reparsing them under an implicit source policy. The input fixture and independent
+binary64 oracle test this conversion across all eight native angle families.
+
+`PhaseAccumulator::new(period, limits)` adds in an explicitly periodic gate
+view. It is not a replacement for literal scalar addition. Named phases enter
+through `add_quarters`, which uses inline modular arithmetic. General values
+enter through checked `add` and `sub`, flattening linear terms into a sparse map.
+Finalization sorts once and uses the core's normalization rules. Returned values
+are representatives in the selected view; scalar users should use `AngleContext`
+arithmetic instead. Select the period through gate semantics before accumulation.
+
+The accumulator captures limits, including a lifetime work budget shared across
+additions and finalization. Atoms and coefficients are bounded by terms, expanded
+nodes, and bits; node accounting reserves a sum root conservatively. Failed
+updates retain its previous values, while attempted work can consume budget.
+`finish` retains its terms but can fail on composite depth, normalization, or
+remaining work. Callers must finalize successfully before changing a circuit or
+Pauli frame. Atoms are owned and can originate from other or expired contexts.
+An internal borrowed expression view supplies node structure to formatting and
+future certified evaluation without exposing fingerprints or interner keys.
+
+The original 37 core tests are supplemented by 13 unit regressions for the
+adapters, accumulation, and circuit baseline, plus two integration tests using
+an independent exact matrix oracle in `Q[zeta_16]`. The oracle checks literal
+phase for all gate families, both scopes, negative and wrapped angles, both
+operand orders, and a spectator wire. The allocation test also checks named
+phase accumulation, single and controlled lowering, and finite legacy conversion.
+
+See [the integration baseline](symbolic-angle-integration-baseline.md) for
+measurements and reproducible benchmark commands.
+
 ## Tests and performance measurements
 
 The 37 core tests compare randomized machine and large-rational arithmetic
