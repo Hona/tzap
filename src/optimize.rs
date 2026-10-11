@@ -17,7 +17,7 @@ use crate::cancel::CancelGates;
 use crate::circuit::{Circuit, Gate, GateKind, GateSet, qubit_operands};
 use crate::cnot_min::CnotMin;
 use crate::decompose::{DecomposeCz, DecomposeRotations, DecomposeToffoli};
-use crate::pass::Pass;
+use crate::pass::{Pass, PassState};
 use crate::phase_fold_pauli::PhaseFoldPauli;
 use crate::phase_fold_rand::PhaseFoldRand;
 #[cfg(test)]
@@ -719,8 +719,9 @@ fn run_pipeline(circuit: &Circuit, passes: &[&dyn Pass], observer: &dyn Observer
     let mut c = circuit.clone();
     observer.progress_start(baseline);
     observer.progress_update(None, &c, baseline);
+    let mut state = PassState::default();
     for p in passes {
-        let next = p.run(&c);
+        let next = p.run_with_state(&c, &mut state);
         c = next;
         observer.progress_update(None, &c, baseline);
     }
@@ -736,11 +737,12 @@ fn run_fixpoint_sweep(
     iteration: usize,
     observer: &dyn Observer,
     baseline: Metrics,
+    state: &mut PassState,
 ) -> Circuit {
     let mut c = circuit.clone();
     observer.progress_update(Some(iteration), &c, baseline);
     for pass in passes {
-        let next = pass.run(&c);
+        let next = pass.run_with_state(&c, state);
         c = next;
         observer.progress_update(Some(iteration), &c, baseline);
     }
@@ -760,6 +762,7 @@ fn run_fixpoint_phase(
     baseline: Metrics,
     first_round: usize,
     max_rounds: Option<usize>,
+    state: &mut PassState,
 ) -> (Circuit, usize, bool) {
     let mut c = circuit.clone();
     let mut round = first_round - 1;
@@ -769,7 +772,7 @@ fn run_fixpoint_phase(
         round += 1;
         swept += 1;
         let before = c.gates.len();
-        c = run_fixpoint_sweep(&c, passes, round, observer, baseline);
+        c = run_fixpoint_sweep(&c, passes, round, observer, baseline, state);
         reduced = c.gates.len() < before;
         if !reduced || max_rounds.is_some_and(|m| swept >= m) {
             break;
@@ -812,8 +815,10 @@ fn run_to_fixpoint(
     let baseline = Metrics::of(circuit);
     observer.progress_start(baseline);
 
-    let (mut c, mut round, mut converged) =
-        run_fixpoint_phase(circuit, passes, observer, baseline, 1, max_rounds);
+    let mut state = PassState::default();
+    let (mut c, mut round, mut converged) = run_fixpoint_phase(
+        circuit, passes, observer, baseline, 1, max_rounds, &mut state,
+    );
 
     if let Some(pass) = rz_decompose {
         let had_rz = c.gates.iter().any(|g| matches!(g, Gate::rz(..)));
@@ -823,8 +828,15 @@ fn run_to_fixpoint(
         if had_rz {
             let spent = round;
             let post_cap = max_rounds.map(|m| m.saturating_sub(spent).max(1));
-            (c, round, converged) =
-                run_fixpoint_phase(&c, passes, observer, baseline, round + 1, post_cap);
+            (c, round, converged) = run_fixpoint_phase(
+                &c,
+                passes,
+                observer,
+                baseline,
+                round + 1,
+                post_cap,
+                &mut state,
+            );
         }
     }
 

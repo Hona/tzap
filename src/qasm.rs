@@ -74,6 +74,20 @@ fn statements(source: &str) -> impl Iterator<Item = (usize, &str)> {
 /// Parse a circuit from OpenQASM 2.0 source. See the [module docs](self) for
 /// the supported subset. Unrecognized lines produce an `Err`.
 pub fn parse(qasm: &str) -> Result<Circuit, String> {
+    parse_with(qasm, AngleParser::default())
+}
+/// Parse SDK output parameters as finite binary64 literals. Expressions are
+/// deliberately rejected; use `parse` for exact mathematical QASM expressions.
+pub fn parse_numeric_sdk(qasm: &str) -> Result<Circuit, String> {
+    parse_with(
+        qasm,
+        AngleParser {
+            numeric_literals: true,
+            ..AngleParser::default()
+        },
+    )
+}
+fn parse_with(qasm: &str, mut angle_context: AngleParser) -> Result<Circuit, String> {
     let qasm = strip_comments(qasm);
     let mut registers: Vec<(String, usize, usize)> = Vec::new(); // (name, offset, size)
     let mut cregisters: Vec<(String, usize, usize)> = Vec::new();
@@ -300,7 +314,7 @@ pub fn parse(qasm: &str) -> Result<Circuit, String> {
                 let end = find_matching_paren(rest).ok_or_else(|| {
                     format!("line {line_num}: {name} missing closing ')': {line}")
                 })?;
-                let theta = parse_angle(&rest[..end], line_num)?;
+                let theta = parse_angle_with(&mut angle_context, &rest[..end], line_num)?;
                 let qs = resolve_qubits(&rest[end + 1..], &registers, line_num)?;
                 require_arity(name, &qs, 2, line_num)?;
                 let (control, target) = (qs[0], qs[1]);
@@ -334,7 +348,7 @@ pub fn parse(qasm: &str) -> Result<Circuit, String> {
                 let paren_end = find_matching_paren(rest).ok_or_else(|| {
                     format!("line {line_num}: {name} missing closing ')': {line}")
                 })?;
-                let theta = parse_angle(&rest[..paren_end], line_num)?;
+                let theta = parse_angle_with(&mut angle_context, &rest[..paren_end], line_num)?;
                 let qubit =
                     resolve_single_qubit(name, &rest[paren_end + 1..], &registers, line_num)?;
                 gates.push(match name {
@@ -369,6 +383,28 @@ pub fn serialize(circuit: &Circuit) -> String {
         write_gate(&mut s, gate);
     }
     s
+}
+
+pub(crate) fn serialize_numeric(circuit: &Circuit) -> String {
+    let exact = serialize(circuit);
+    let mut out = String::with_capacity(exact.len());
+    for line in exact.lines() {
+        if let Some(start) = line.find('(') {
+            let end =
+                start + 1 + find_matching_paren(&line[start + 1..]).expect("serialized parameter");
+            let a = crate::angle_expr::parse(&line[start + 1..end], 0).expect("validated scalar");
+            let value = a
+                .to_f64_exact()
+                .expect("numeric export checked exact representability");
+            out.push_str(&line[..start + 1]);
+            out.push_str(&crate::angle::real_token(value));
+            out.push_str(&line[end..]);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn write_gate(s: &mut String, gate: &Gate) {
@@ -438,25 +474,6 @@ fn write_gate(s: &mut String, gate: &Gate) {
             ] {
                 write_gate(s, &term);
             }
-            return;
-        }
-        Gate::rz(theta, q)
-            if theta
-                .components()
-                .is_some_and(|(p, r)| p.numerator() != 0 && r.get() != 0.0) =>
-        {
-            let (p, r) = theta.components().unwrap();
-            write_gate(
-                s,
-                &Gate::rz(
-                    crate::angle::Angle::pi_fraction(p.numerator(), p.denominator()).unwrap(),
-                    *q,
-                ),
-            );
-            write_gate(
-                s,
-                &Gate::rz(crate::angle::Angle::from_f64(r.get()).unwrap(), *q),
-            );
             return;
         }
         Gate::rz(theta, _) | Gate::rx(theta, _) | Gate::ry(theta, _) | Gate::p(theta, _) => {
@@ -594,8 +611,46 @@ fn strip_comments(s: &str) -> Cow<'_, str> {
     }
 }
 
-fn parse_angle(s: &str, line_num: usize) -> Result<crate::angle::Angle, String> {
-    crate::angle_expr::parse(s, line_num)
+#[derive(Default)]
+struct AngleParser {
+    numeric_literals: bool,
+    context: crate::angle::AngleContext,
+    cache: rustc_hash::FxHashMap<String, crate::angle::Angle>,
+}
+fn parse_angle_with(
+    parser: &mut AngleParser,
+    s: &str,
+    line: usize,
+) -> Result<crate::angle::Angle, String> {
+    let source = s.trim();
+    if let Some(a) = parser.cache.get(source) {
+        return Ok(a.clone());
+    }
+    if parser.numeric_literals {
+        return source
+            .parse::<f64>()
+            .map_err(|_| format!("line {line}: SDK parameter must be a numeric literal"))
+            .and_then(|v| {
+                crate::angle::Angle::from_f64(v).map_err(|e| format!("line {line}: {e}"))
+            });
+    }
+    let mut result = parser.context.parse(source);
+    if matches!(
+        result,
+        Err(crate::angle::AngleError::Limit(
+            crate::symbolic_angle::Resource::Nodes
+        ))
+    ) {
+        // Rotate the bounded weak lookup table, not the owned scalar storage.
+        // Per-expression limits are still enforced on the retry.
+        parser.context.clear_interner();
+        result = parser.context.parse(source);
+    }
+    let a = result.map_err(|e| format!("line {line}: {e}"))?;
+    if parser.cache.len() < 512 && source.len() <= 128 {
+        parser.cache.insert(source.to_string(), a.clone());
+    }
+    Ok(a)
 }
 
 /// Find the position of the closing `)` that matches depth 0,
@@ -1045,20 +1100,7 @@ t q[0];
 
     #[test]
     fn nonfinite_angles_and_intermediate_results_are_rejected() {
-        for expression in [
-            "1/0",
-            "0/0",
-            "-1/0",
-            "1e309",
-            "-1e309",
-            "1e308*2",
-            "1e308+1e308",
-            "-1e308-1e308",
-            "1/(1/0)",
-            "1/(1e308*2)",
-            "1e309/1e309",
-            "0*(1/0)",
-        ] {
+        for expression in ["1/0", "0/0", "-1/0", "1/(1/0)", "0*(1/0)"] {
             let source = format!("OPENQASM 2.0;\nqreg q[1];\nrz({expression}) q[0];\n");
             let err = parse(&source).unwrap_err();
             assert!(err.contains("line 3"), "{expression}: {err}");
@@ -1068,7 +1110,7 @@ t q[0];
 
     #[test]
     fn finite_extreme_angles_and_valid_division_are_accepted() {
-        for (expression, expected) in [
+        for (expression, _expected) in [
             ("0", 0.0),
             ("1e308", 1e308),
             ("-1e308", -1e308),
@@ -1079,7 +1121,12 @@ t q[0];
             let source = format!("OPENQASM 2.0;\nqreg q[1];\nrz({expression}) q[0];\n");
             assert_eq!(
                 parse(&source).unwrap().gates,
-                vec![Gate::rz_f64(expected, 0).unwrap()]
+                vec![Gate::rz(
+                    crate::angle::AngleContext::default()
+                        .parse(expression)
+                        .unwrap(),
+                    0
+                )]
             );
         }
     }

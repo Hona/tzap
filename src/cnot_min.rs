@@ -52,7 +52,7 @@ use crate::angle::Angle;
 use rustc_hash::FxHashMap;
 
 use crate::circuit::{Circuit, Gate, Qubit};
-use crate::pass::Pass;
+use crate::pass::{Pass, PassState};
 
 /// A parity: bit `i` is set when local qubit `i`'s starting value is XOR-ed
 /// into it. One `u128` bounds a block at [`MAX_CHUNK_QUBITS`] qubits, which is
@@ -119,6 +119,9 @@ impl Pass for CnotMin {
     fn run(&self, circuit: &Circuit) -> Circuit {
         cnot_min_with(circuit, self.max_qubits, self.max_terms)
     }
+    fn run_with_state(&self, circuit: &Circuit, state: &mut PassState) -> Circuit {
+        cnot_min_with_state(circuit, self.max_qubits, self.max_terms, state)
+    }
 }
 
 /// Free-function form of [`CnotMin`] at its default bounds.
@@ -130,10 +133,19 @@ pub fn cnot_min(circuit: &Circuit) -> Circuit {
 /// [`Parity`] can address, and both bounds to at least one, since a block that
 /// can hold nothing at all would never make progress.
 pub fn cnot_min_with(circuit: &Circuit, max_qubits: usize, max_terms: usize) -> Circuit {
+    cnot_min_with_state(circuit, max_qubits, max_terms, &mut PassState::default())
+}
+fn cnot_min_with_state(
+    circuit: &Circuit,
+    max_qubits: usize,
+    max_terms: usize,
+    state: &mut PassState,
+) -> Circuit {
     let max_qubits = max_qubits.clamp(1, MAX_CHUNK_QUBITS);
     let max_terms = max_terms.max(1);
     let mut output = circuit.empty_like();
     let mut chunk = Chunk::new(circuit.num_qubits, max_qubits, max_terms);
+    std::mem::swap(&mut chunk.angles, &mut state.angles);
 
     for gate in &circuit.gates {
         if let Some(passthrough) = chunk.feed(gate, &mut output) {
@@ -143,6 +155,7 @@ pub fn cnot_min_with(circuit: &Circuit, max_qubits: usize, max_terms: usize) -> 
         }
     }
     chunk.flush(&mut output);
+    std::mem::swap(&mut chunk.angles, &mut state.angles);
     output
 }
 
@@ -172,6 +185,8 @@ fn cnot_min_unbounded(circuit: &Circuit) -> Circuit {
 /// three-qubit problem. `parity[i]` is a XOR of the values the block's qubits
 /// held on entry, and `consts[i]` records an odd number of X gates on top.
 struct Chunk {
+    accumulations: FxHashMap<Parity, crate::symbolic_angle::PhaseAccumulator>,
+    angles: crate::angle::AngleContext,
     max_qubits: usize,
     max_terms: usize,
     /// Local index -> circuit qubit.
@@ -225,6 +240,8 @@ struct Scratch {
 impl Chunk {
     fn new(num_qubits: usize, max_qubits: usize, max_terms: usize) -> Self {
         Chunk {
+            accumulations: FxHashMap::default(),
+            angles: crate::angle::AngleContext::default(),
             max_qubits,
             max_terms,
             qubits: Vec::new(),
@@ -386,15 +403,51 @@ impl Chunk {
         if self.arithmetic_failed {
             return;
         }
-        let signed = if k { angle.checked_neg() } else { Ok(angle) };
-        let Ok(signed) = signed else {
-            self.arithmetic_failed = true;
+        let complex = angle.expression_depth() > 1
+            || self.terms.get(&p).is_some_and(|a| a.expression_depth() > 1)
+            || (!self.accumulations.is_empty() && self.accumulations.contains_key(&p));
+        if complex {
+            let result = (|| {
+                if !self.accumulations.contains_key(&p) {
+                    let mut accumulator = crate::symbolic_angle::PhaseAccumulator::new(
+                        crate::angle::RotationPeriod::TwoPi,
+                        self.angles.limits(),
+                    );
+                    if let Some(prior) = self.terms.get(&p) {
+                        accumulator.add(&mut self.angles, prior)?;
+                    }
+                    self.accumulations.insert(p, accumulator);
+                }
+                let accumulator = self.accumulations.get_mut(&p).unwrap();
+                if k {
+                    accumulator.sub(&mut self.angles, &angle)?;
+                } else {
+                    accumulator.add(&mut self.angles, &angle)?;
+                }
+                self.terms.entry(p).or_insert(Angle::ZERO);
+                Ok::<(), crate::angle::AngleError>(())
+            })();
+            if let Err(error) = result {
+                crate::angle_stats::failure(error);
+                self.arithmetic_failed = true;
+            }
             return;
+        }
+        let signed = if k {
+            self.angles.neg(&angle)
+        } else {
+            Ok(angle)
+        };
+        let signed = match signed {
+            Ok(angle) => angle,
+            Err(error) => {
+                crate::angle_stats::failure(error);
+                self.arithmetic_failed = true;
+                return;
+            }
         };
         let next = if let Some(prior) = self.terms.get(&p) {
-            prior.checked_add_signed(1, &signed)
-        } else if signed.is_preserved() {
-            Err(crate::angle::AngleError::PreservedExpression)
+            prior.merge_phases_with(&mut self.angles, 1, &signed)
         } else {
             Ok(signed)
         };
@@ -416,6 +469,20 @@ impl Chunk {
         if self.original.is_empty() {
             self.reset();
             return;
+        }
+        if !self.arithmetic_failed {
+            for (p, accumulator) in &mut self.accumulations {
+                match accumulator.finish(&mut self.angles) {
+                    Ok(angle) => {
+                        self.terms.insert(*p, angle);
+                    }
+                    Err(error) => {
+                        crate::angle_stats::failure(error);
+                        self.arithmetic_failed = true;
+                        break;
+                    }
+                }
+            }
         }
         let (old_2q, old_all) = (count_2q(&self.original), self.original.len());
         // The budget bounds synthesis by the original's own size. It never
@@ -467,6 +534,7 @@ impl Chunk {
     /// be renamed back to one variable per qubit at every block boundary, and
     /// a parity never needs more bits than the circuit has qubits.
     fn reset(&mut self) {
+        self.accumulations.clear();
         for &q in &self.qubits {
             self.local[q as usize] = usize::MAX;
         }
@@ -573,7 +641,7 @@ fn synthesize(
     phases.extend(
         terms
             .iter()
-            .filter(|(_, a)| !a.is_zero())
+            .filter(|(_, a)| !a.projective_identity())
             .map(|(&p, a)| (p, a.clone())),
     );
     // Iteration order of a hash map is not deterministic across runs; the

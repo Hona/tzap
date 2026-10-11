@@ -12,7 +12,7 @@ from qiskit.dagcircuit import DAGCircuit
 from qiskit.transpiler import PassManager, TransformationPass
 from qiskit.transpiler.exceptions import TranspilerError
 
-from ._angles import angle_radians, sdk_qasm
+from ._angles import angle_radians, exact_float_expression, sdk_qasm
 from ._core import optimize_qasm
 
 _ARITIES = {
@@ -98,7 +98,7 @@ def _dag_to_qasm(dag: DAGCircuit) -> str:
                 ) from error
             if not math.isfinite(angle):
                 raise TranspilerError(f"tzap requires finite {name} angles")
-            lines.append(f"{name}({angle!r}) {operands};")
+            lines.append(f"{name}({exact_float_expression(angle)}) {operands};")
         elif name == "measure":
             if len(node.cargs) != 1:
                 raise TranspilerError("measure must target exactly one classical bit")

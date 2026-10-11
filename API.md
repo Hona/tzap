@@ -49,7 +49,8 @@ still work unannotated; a `usize` index needs `as u32`.
 
 All parameterized gates take a checked `Angle`, rather than an `f64`. This is a Rust
 source compatibility change. Explicit fractions retain mathematical pi;
-numeric inputs retain their exact finite binary64 value:
+numeric inputs retain their exact finite binary64 value. `angle::Angle` and
+`symbolic_angle::Angle` are the same type:
 
 ```rust
 use tzap::{angle::Angle, circuit::Gate};
@@ -66,11 +67,33 @@ CRX/CRY/CRZ at 2π retain their control-branch phase.
 
 A numeric `PI/4` is not inferred to be an exact pi fraction. Default folding
 never adds rounding, snaps a small rotation to zero, or wraps a float modulo
-a floating approximation to pi. A merge that would round or overflow is
-skipped. Named T/S/Z gates retain exact discrete arithmetic. See
+a floating approximation to pi. Arithmetic promotes to arbitrary-precision
+coefficients when needed. A resource limit or unproved rewrite leaves the affected
+gates intact. Named T/S/Z gates retain exact discrete arithmetic. See
 [the migration notes](docs/angle-soundness-migration.md).
 
+Use `AngleContext` to construct general expressions, for example
+`ctx.parse("sin(pi/7) + sqrt(2)/3")?`. All eight parameterized gate families
+store these expressions directly. Equality and hashing compare literal scalars;
+`0`, `2*pi`, and `4*pi` are distinct. Gate-aware proof queries supply a rotation
+period explicitly. Controlled RX/RY/RZ use `4*pi` to retain relative phases.
+
+Each optimization pipeline owns an arithmetic context; parallel workers own
+independent contexts. `Pass::run_with_state` accepts a `PassState` for shared
+interning and configurable `Limits`. Values survive that context's destruction.
+See [the symbolic core](docs/symbolic-angle-core.md).
+
 ### QASM I/O
+
+QASM decimal literals and expressions are exact: `0.1+0.2` means `3/10`.
+`sin`, `cos`, `tan`, `exp`, `ln`, `sqrt`, and integer powers remain symbolic.
+Serialization preserves exact scalar expressions. `parse_numeric_sdk` explicitly
+interprets finite numeric literals as binary64 inputs; Qiskit and PennyLane
+imports instead encode their existing float parameters as exact rational text.
+Safe SDK export emits exact named phases and sums of binary64 parameters when
+possible, and rejects unsupported conversions. Explicit lossy export records
+uncertified conversions. Certified rotation synthesis encloses the whole
+expression before independently verifying the resulting gate word.
 
 Parse from and convert to OpenQASM 2.0. `from_qasm` returns
 `Result<Circuit, String>`:
@@ -97,18 +120,12 @@ original checked angle without half-angle rounding.
 The QASM parser accepts `ccz` as a native circuit gate. `DecomposeToffoli`
 lowers both `ccx` and `ccz` to Clifford+T.
 
-The parser recognizes contextual rational pi coefficients such as `0.1*pi`
-and `(1+2)*pi/8` exactly. Wholly numeric expressions use binary64 source
-evaluation, so `0.1+0.2` keeps its rounded input value. Supported non-affine
-pi expressions use recorded numeric fallback. Coefficient-limit expressions
-are preserved unchanged, excluded from folding, and warned about by the CLI
-and Python wrapper. Powers, calculator functions, and gate definitions remain
-outside the supported subset. Expressions may span lines.
-
-QASM output retains symbolic fractions. Mixed values serialize as adjacent
-pi and numeric Rz operations. `qasm::serialize_numeric_lossy` is an explicit
-approximate export; its result counts uncertified fraction conversions and it
-rejects preserved expressions.
+Expressions may span lines. Native QASM serialization retains complete exact
+expressions, including mixed pi and rational values. Resource and domain failures
+produce explicit errors. Custom gate definitions and free parameters remain
+outside the supported subset. `qasm::serialize_sdk` performs exact numeric export;
+`serialize_numeric_lossy` explicitly permits approximation and counts each
+uncertified conversion.
 
 ## Optimizing
 
@@ -144,7 +161,7 @@ CCX/CCZ, CZ, or Rz decomposition.
 | `decompose_rz` | `false` | Compatibility alias for `decompose_rotations` |
 | `decompose_cz` | `false` | Decompose CZ into H+CX+H before optimizing |
 | `decompose_ccx` | `false` | Decompose CCX and CCZ into Clifford+T |
-| `rz_epsilon` | `1e-10` | Per-input-gate numeric-target epsilon for rotation decomposition |
+| `rz_epsilon` | `1e-10` | Per-input-gate certified spectral epsilon for rotation decomposition |
 | `parallel` | `false` | Optimize gate-contiguous chunks concurrently, then concatenate |
 | `superopt` | all `None` | Per-run overrides for the SuperOpt window/MURM bounds |
 | `superopt_gates` | `Auto` | Base MURM basis plus native CZ/CCX/CCZ gates present in the current stage |
@@ -155,35 +172,25 @@ point), and `output`. Requested decompositions are opt-in middle stages:
 optimize the input circuit, decompose CCX/CCZ then CZ then rotations, and optimize
 again when a decomposition changed the circuit.
 
-`Report::numerical` records preserved expressions, numeric input fallback,
-skipped rounded/nonfinite/coefficient-limit folds, randomized matching, and
-uncertified synthesis calls. The guarantee starts at accepted angles, rather
-than ideal real source-expression semantics. `PhaseFoldRand` still uses
-unchecked randomized Boolean-function matches; its collision guarantee is
-separate from exact angle arithmetic. An explicit pipeline omitting that pass
-can use deterministic matching.
+`Report::numerical` records resource-limited folds, randomized matching,
+certified syntheses and their outward-summed error bounds. Legacy preserved-source,
+numeric-fallback and rounded/nonfinite-fold fields remain present and are zero
+under the `exact_symbolic` input policy. `PhaseFoldRand` uses randomized Boolean
+matching with its existing collision bound, independently of exact angle arithmetic.
 
-Explicit `DecomposeRotations` requests permit approximation. Its per-rotation epsilon
-belongs to the numeric target passed to gridsynth; total conversion error and
-whole-circuit error are uncertified. `DecomposeRotations::try_run` and the optimization
-driver return a structured synthesis error for inputs that cannot be converted.
-The infallible `Pass` adapter conservatively returns the original circuit on a
-synthesis error; callers requiring synthesis must use `try_run` or the driver.
-Certified quarter-turns lower exactly before synthesis, SuperOpt, or PBC.
-Other parametric gates remain outside SuperOpt's exact matrix domain.
-
-Controlled rotations expand into unconditional half-angle rotations and two
-CNOTs before synthesis. CP also needs P(lambda/2) on the control; it differs
-from CRZ. Half-angles use checked arithmetic without projective normalization:
-unrepresentable halves produce a synthesis error. Each controlled rotation
-splits its epsilon between two numeric targets; CP uses three. Discarded
-synthesis phases are therefore whole-circuit global phases. Large numeric
-angles use bounded native eigenphases for synthesis; this conversion remains
-uncertified, as does total circuit error.
+Explicit `DecomposeRotations` requests permit approximation of complete symbolic
+input angles. An integer interval evaluator bounds target conversion and reduction;
+an independent verifier checks the resulting gate words, including full controlled
+operators. Epsilon is a positive finite binary64 per-input-gate spectral bound;
+requests below `1e-80` or beyond evaluator resource limits fail explicitly. Summed
+bounds cover synthesis error, and the existing probabilistic matching contract
+remains separate. Exact folds add no arithmetic rounding.
+`DecomposeRotations::try_run` and the optimizer return errors when certification fails; the infallible `Pass` adapter
+returns the original circuit. Exact quarter turns lower without approximation.
 
 Y, SX, SWAP, CY, CH, and CSWAP have exact input matrices for SuperOpt; its
-synthesis basis remains unchanged. PBC rejects these native gates, as well as
-parametric gates, unless they have been expanded into its supported basis.
+synthesis basis remains unchanged. PBC conversion expands supported native
+Clifford gates exactly and requires rotation synthesis for non-quarter angles.
 
 The post-decomposition MURM basis excludes every gate family requested for
 decomposition, including gates named in an explicit `superopt_gates` basis.

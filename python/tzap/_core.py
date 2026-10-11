@@ -38,7 +38,7 @@ class NumericalReport:
     certified_syntheses: int = 0
     failed_certifications: int = 0
     certified_error_bound: float | None = 0.0
-    input_policy: str = "accepted_angles"
+    input_policy: str = "exact_symbolic"
     folding: str = "no_added_rounding"
     synthesis_error_scope: str = (
         "accepted_angle_per_input_gate; summed_bound_covers_synthesis_only"

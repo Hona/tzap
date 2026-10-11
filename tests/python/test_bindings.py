@@ -389,21 +389,20 @@ def test_non_string_pass_item_is_rejected_by_binding_type_check():
         tzap.optimize_qasm(QASM, passes=["CancelGates", 123])
 
 
-def test_numerical_contract_and_preserved_expression_warning():
+def test_numerical_contract_and_exact_large_coefficient():
     source = make_qasm("rz(pi/9223372036854775808) q[0];")
-    with pytest.warns(RuntimeWarning, match="retained 1 angle"):
-        result = tzap.optimize_qasm(source, level="O1")
-    assert "pi/9223372036854775808" in result.qasm
-    assert result.report.numerical.preserved_expressions == 1
-    assert result.report.numerical.input_policy == "accepted_angles"
+    result = tzap.optimize_qasm(source, level="O1")
+    assert "(1/9223372036854775808)*pi" in result.qasm
+    assert result.report.numerical.preserved_expressions == 0
+    assert result.report.numerical.input_policy == "exact_symbolic"
     assert result.report.numerical.randomized_matching
 
 
 def test_no_float_pi_inference_or_rounded_folding():
     source = make_qasm("rz(1e16) q[0]; rz(1) q[0]; rz(-1e16) q[0];")
     result = tzap.optimize_qasm(source, passes=["PhaseFoldRand"])
-    assert result.report.output.rz == 3
-    assert result.report.numerical.skipped_rounded_folds == 2
+    assert result.report.output.rz == 1
+    assert result.report.numerical.skipped_rounded_folds == 0
     result = tzap.optimize_qasm(make_qasm(f"rz({math.pi / 4!r}) q[0];"), level="O1")
     assert result.report.output.rz == 1
     assert result.report.output.t == 0

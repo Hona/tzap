@@ -1,7 +1,7 @@
 //! Certified synthesis of accepted angles. The dependency proposes a word;
 //! independent integer interval arithmetic decides whether it is acceptable.
 mod exact_word;
-mod interval;
+pub(crate) mod interval;
 use crate::angle::Angle;
 use crate::circuit::Gate;
 use dashu_float::{FBig, round::mode::HalfEven};
@@ -68,16 +68,9 @@ fn prepare_scaled_with_period(
     period: i64,
     scale: Scale,
 ) -> Result<Target, Failure> {
-    let (pi_coefficient, residual) = angle
-        .components()
-        .ok_or("preserved angle expression cannot be synthesized")?;
     let ctx = Context::new(bits);
     let pi = ctx.pi();
-    let coefficient = BigInt::from(pi_coefficient.numerator());
-    let theta = pi
-        .scale(&coefficient)
-        .div_int(pi_coefficient.denominator() as u64)
-        .add(&ctx.float(residual.get()));
+    let theta = crate::symbolic_angle::evaluate::enclose(angle, &ctx).map_err(Failure::Interval)?;
     let theta = match scale {
         Scale::Whole => theta,
         Scale::Half => theta.div_int(2),
@@ -134,54 +127,39 @@ pub(crate) fn verify_controlled(input: &Gate, gates: &[Gate], epsilon: f64) -> R
         } => (theta, *control, *target),
         _ => return Err("expected a controlled rotation".into()),
     };
-    let (_, residual) = angle.components().ok_or("preserved controlled angle")?;
-    let exponent = ((residual.get().to_bits() >> 52) & 2047) as usize;
+    let exact = controlled_word(gates, control, target)?;
     let accuracy = (-epsilon.min(1.0).log2()).ceil() as usize;
-    let bits = exponent.saturating_sub(1022).max(64) + accuracy + 128;
-    let prepared = prepare_with_period(angle, bits.min(MAX_BITS), 4)?;
-    let ctx = &prepared.ctx;
-    let mut expected = two_identity(ctx);
-    // Local bit 0 is the control, local bit 1 the target, independently of
-    // physical operand ordering. CR* must retain its literal 4*pi period.
-    let cos = prepared.matrix[0][0].re.clone();
-    let sin = prepared.matrix[1][1].im.clone();
-    match input {
-        Gate::cp { .. } => {
-            let (sin, cos) = ctx
-                .sin_cos(&prepared.reduced.div_int(2))
-                .map_err(Failure::Interval)?;
-            // Square exp(i theta/2); avoid a larger trig kernel argument.
-            let half = Complex { re: cos, im: sin };
-            expected[3][3] = half.mul(&half, ctx);
+    let mut bits = angle
+        .coefficient_bits()
+        .max(64)
+        .saturating_add(accuracy + 128)
+        .min(MAX_BITS);
+    loop {
+        match verify_controlled_at_precision(input, angle, &exact, epsilon, bits) {
+            Ok(ControlledVerification::Verified) => return Ok(()),
+            Ok(ControlledVerification::Rejected) => {
+                return Err(Failure::Verification(
+                    "complete controlled operator failed certification",
+                ));
+            }
+            Ok(ControlledVerification::Inconclusive) if bits < MAX_BITS => {}
+            Err(Failure::Interval(_)) if bits < MAX_BITS => {}
+            Ok(ControlledVerification::Inconclusive) => {
+                return Err(Failure::Verification(
+                    "complete controlled operator failed certification at the precision limit",
+                ));
+            }
+            Err(error) => return Err(error),
         }
-        Gate::crz { .. } => {
-            expected[1][1] = prepared.matrix[0][0].clone();
-            expected[3][3] = prepared.matrix[1][1].clone();
-        }
-        Gate::crx { .. } => {
-            expected[1][1].re = cos.clone();
-            expected[3][3].re = cos;
-            let off = Complex {
-                re: ctx.integer(0),
-                im: sin.neg(),
-            };
-            expected[1][3] = off.clone();
-            expected[3][1] = off;
-        }
-        Gate::cry { .. } => {
-            expected[1][1].re = cos.clone();
-            expected[3][3].re = cos;
-            expected[1][3] = Complex {
-                re: sin.neg(),
-                im: ctx.integer(0),
-            };
-            expected[3][1] = Complex {
-                re: sin,
-                im: ctx.integer(0),
-            };
-        }
-        _ => unreachable!(),
+        bits = (bits * 2).min(MAX_BITS);
     }
+}
+
+fn controlled_word(
+    gates: &[Gate],
+    control: u32,
+    target: u32,
+) -> Result<exact_word::ExactWord<4>, Failure> {
     let mut exact = exact_word::ExactWord::<4>::identity();
     for gate in gates {
         if let Gate::cnot {
@@ -227,6 +205,66 @@ pub(crate) fn verify_controlled(input: &Gate, gates: &[Gate], epsilon: f64) -> R
             exact.apply(*instruction, q).map_err(Failure::Interval)?;
         }
     }
+    Ok(exact)
+}
+
+enum ControlledVerification {
+    Verified,
+    Rejected,
+    Inconclusive,
+}
+
+fn verify_controlled_at_precision(
+    input: &Gate,
+    angle: &Angle,
+    exact: &exact_word::ExactWord<4>,
+    epsilon: f64,
+    bits: usize,
+) -> Result<ControlledVerification, Failure> {
+    let prepared = prepare_with_period(angle, bits, 4)?;
+    let ctx = &prepared.ctx;
+    let mut expected = two_identity(ctx);
+    // Local bit 0 is the control, local bit 1 the target, independently of
+    // physical operand ordering. CR* must retain its literal 4*pi period.
+    let cos = prepared.matrix[0][0].re.clone();
+    let sin = prepared.matrix[1][1].im.clone();
+    match input {
+        Gate::cp { .. } => {
+            let (sin, cos) = ctx
+                .sin_cos(&prepared.reduced.div_int(2))
+                .map_err(Failure::Interval)?;
+            // Square exp(i theta/2); avoid a larger trig kernel argument.
+            let half = Complex { re: cos, im: sin };
+            expected[3][3] = half.mul(&half, ctx);
+        }
+        Gate::crz { .. } => {
+            expected[1][1] = prepared.matrix[0][0].clone();
+            expected[3][3] = prepared.matrix[1][1].clone();
+        }
+        Gate::crx { .. } => {
+            expected[1][1].re = cos.clone();
+            expected[3][3].re = cos;
+            let off = Complex {
+                re: ctx.integer(0),
+                im: sin.neg(),
+            };
+            expected[1][3] = off.clone();
+            expected[3][1] = off;
+        }
+        Gate::cry { .. } => {
+            expected[1][1].re = cos.clone();
+            expected[3][3].re = cos;
+            expected[1][3] = Complex {
+                re: sin.neg(),
+                im: ctx.integer(0),
+            };
+            expected[3][1] = Complex {
+                re: sin,
+                im: ctx.integer(0),
+            };
+        }
+        _ => unreachable!(),
+    }
     let actual = exact.intervals(ctx);
     // Normalize by the phase of the inactive-control |00> amplitude. Its
     // exact magnitude is nonzero when the lower interval bound proves it.
@@ -239,21 +277,27 @@ pub(crate) fn verify_controlled(input: &Gate, gates: &[Gate], epsilon: f64) -> R
         re: ctx.mul(&anchor.re, &reciprocal),
         im: ctx.mul(&anchor.im.neg(), &reciprocal),
     };
-    let mut squared = BigInt::from(0);
+    let mut squared_lower = BigInt::from(0);
+    let mut squared_upper = BigInt::from(0);
     for i in 0..4 {
         for j in 0..4 {
-            squared += actual[i][j]
+            let (lower, upper) = actual[i][j]
                 .mul(&phase, ctx)
-                .difference_square_upper(&expected[i][j]);
+                .difference_square_bounds(&expected[i][j]);
+            squared_lower += lower;
+            squared_upper += upper;
         }
     }
     let budget = ctx.float(epsilon);
-    if squared <= &budget.lo * &budget.lo {
-        Ok(())
+    if squared_upper <= &budget.lo * &budget.lo {
+        Ok(ControlledVerification::Verified)
+    } else if squared_lower > &budget.hi * &budget.hi {
+        // This phase-normalized Frobenius certificate cannot pass even with
+        // tighter enclosures. In particular, a nonidentity rotation need not
+        // exhaust the precision budget during the initial empty-word probe.
+        Ok(ControlledVerification::Rejected)
     } else {
-        Err(Failure::Verification(
-            "complete controlled operator failed certification",
-        ))
+        Ok(ControlledVerification::Inconclusive)
     }
 }
 fn dyadic(integer: &BigInt, bits: usize, precision: usize) -> FBig<HalfEven> {
@@ -288,17 +332,30 @@ pub(crate) fn synthesize_scaled(
     ) {
         return Ok(word.clone());
     }
-    let (_, residual) = angle
-        .components()
-        .ok_or("preserved angle expression cannot be synthesized")?;
-    let exponent = ((residual.get().to_bits() >> 52) & 2047) as usize;
-    let magnitude_bits = exponent.saturating_sub(1022).max(64);
     let accuracy_bits = (-epsilon.min(1.0).log2()).ceil() as usize;
-    let bits = magnitude_bits + accuracy_bits + 128;
+    let mut bits = angle
+        .coefficient_bits()
+        .max(64)
+        .saturating_add(accuracy_bits + 128);
     if bits > MAX_BITS {
         return Err(Failure::Limit("certification precision limit reached"));
     }
-    let target = prepare_scaled_with_period(angle, bits, 2, scale)?;
+    let target = loop {
+        match prepare_scaled_with_period(angle, bits, 2, scale) {
+            Ok(target)
+                if target.reduced.hi.clone() - &target.reduced.lo
+                    <= target.ctx.float(epsilon / 16.0).lo =>
+            {
+                break target;
+            }
+            _ if bits < MAX_BITS => bits = (bits * 2).min(MAX_BITS),
+            _ => {
+                return Err(Failure::Interval(
+                    "symbolic target could not be enclosed within the precision budget",
+                ));
+            }
+        }
+    };
     let budget = target.ctx.float(epsilon.min(1.0));
     // Tiny rotations may be proved close to I without calling the synthesizer.
     if interval::verifies(&target.matrix, &[], &target.pi, &budget, &target.ctx)

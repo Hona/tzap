@@ -492,7 +492,22 @@ fn huge_tiny_and_near_clifford_angles_are_never_reduced_or_snapped() {
             1,
             vec![kind.numeric_gate(1e308, 0), kind.numeric_gate(1e308, 0)],
         );
-        assert_eq!(phase_fold_pauli(&c).gates, c.gates);
+        let out = phase_fold_pauli(&c);
+        assert_eq!(out.gates.len(), 1);
+        assert_eq!(
+            out.gates[0]
+                .angle()
+                .unwrap()
+                .as_rational()
+                .unwrap()
+                .to_big_rational(),
+            crate::angle::Angle::from_f64(1e308)
+                .unwrap()
+                .as_rational()
+                .unwrap()
+                .to_big_rational()
+                * num_rational::BigRational::from_integer(2.into())
+        );
         let c = circuit(
             1,
             vec![
@@ -501,8 +516,8 @@ fn huge_tiny_and_near_clifford_angles_are_never_reduced_or_snapped() {
                 kind.numeric_gate(-1e16, 0),
             ],
         );
-        // A lossy sum is refused; the intervening small contribution survives.
-        assert_eq!(phase_fold_pauli(&c).gates, c.gates);
+        // Promotion retains the small contribution through huge cancellation.
+        verify(&c, &[kind.numeric_gate(1.0, 0)]);
         let c = circuit(
             1,
             vec![kind.numeric_gate(1e16, 0), kind.numeric_gate(1e16, 0)],
@@ -714,13 +729,20 @@ impl RotationKind {
 }
 
 #[test]
-fn checked_native_folding_refuses_rounded_sums_and_retains_symbolic_parts() {
+fn checked_native_folding_promotes_rounded_sums_and_retains_symbolic_parts() {
     for kind in KINDS {
         let c = circuit(
             1,
             vec![kind.numeric_gate(0.1, 0), kind.numeric_gate(0.2, 0)],
         );
-        assert_eq!(phase_fold_pauli(&c).gates, c.gates);
+        let output = phase_fold_pauli(&c);
+        assert_eq!(output.gates.len(), 1);
+        let mut ctx = crate::angle::AngleContext::default();
+        assert_eq!(
+            output.gates[0].angle().unwrap(),
+            &ctx.add(c.gates[0].angle().unwrap(), c.gates[1].angle().unwrap())
+                .unwrap()
+        );
         let c = circuit(
             1,
             vec![

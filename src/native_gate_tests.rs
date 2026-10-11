@@ -61,9 +61,13 @@ fn every_parameterized_gate_preserves_pi_fractions_and_opaque_expressions() {
         };
         let (output, report) = optimize(&input, &options).unwrap();
         assert_eq!(input.gates, output.gates);
-        assert_eq!(report.numerical.preserved_expressions, 1);
-        assert!(output.to_qasm().contains("pi/9223372036854775808"));
-        assert!(DecomposeRotations::default().try_run(&input).is_err());
+        assert_eq!(report.numerical.preserved_expressions, 0);
+        assert!(crate::unitary::circuits_equiv(
+            &output,
+            &Circuit::from_qasm(&output.to_qasm()).unwrap(),
+            1e-12
+        ));
+        assert!(DecomposeRotations::default().try_run(&input).is_ok());
     }
 }
 

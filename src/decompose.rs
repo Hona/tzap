@@ -145,7 +145,7 @@ impl Pass for DecomposeRotations {
     }
 }
 
-/// A synthesis failure; preserved expressions have no permitted numeric value.
+/// A synthesis failure, including unresolved enclosures and resource limits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SynthesisError(pub String);
 impl std::fmt::Display for SynthesisError {
@@ -194,7 +194,8 @@ impl DecomposeRotations {
                         synthesize_single_rotation(gate, epsilon).map(|gates| {
                             (
                                 gates,
-                                gate.angle().is_some_and(|a| a.quarter_turns().is_none()),
+                                gate.angle()
+                                    .is_some_and(|a| a.projective_quarters().is_none()),
                             )
                         })
                     }
@@ -313,20 +314,17 @@ fn synthesize_controlled_rotation(
     // entire original gate, not a tiny-angle deletion by an exact optimizer.
     if synthesis::verify_controlled(gate, &[], epsilon).is_ok() {
         let period = if matches!(gate, Gate::cp { .. }) {
-            2
+            crate::angle::RotationPeriod::TwoPi
         } else {
-            4
+            crate::angle::RotationPeriod::FourPi
         };
-        let exact_identity = angle.components().is_some_and(|(p, r)| {
-            r.get().to_bits() == 0
-                && p.numerator() as i128 % (period * p.denominator() as i128) == 0
-        });
+        let exact_identity = angle.prove_identity(period) == crate::angle::Proof::Proven;
         return Ok(Some((Vec::new(), !exact_identity)));
     }
     let exact_half = angle
         .checked_half()
         .ok()
-        .filter(|a| a.quarter_turns().is_some());
+        .filter(|a| a.projective_quarters().is_some());
     let approximate = exact_half.is_none();
     let count = if matches!(gate, Gate::cp { .. }) {
         3
@@ -412,7 +410,7 @@ fn synthesize_single_rotation(gate: &Gate, epsilon: f64) -> Result<Vec<Gate>, Sy
     if matches!(gate, Gate::rx(..) | Gate::ry(..)) {
         gates.push(Gate::h(q));
     }
-    if theta.quarter_turns().is_some() {
+    if theta.projective_quarters().is_some() {
         gates.extend(theta.rotation_gates(q));
     } else {
         let word = crate::synthesis::synthesize(theta, epsilon)

@@ -66,7 +66,7 @@ pub fn to_pbc(circuit: &Circuit, max_weight: Option<NonZeroUsize>) -> Result<Pbc
     u32::try_from(circuit.num_qubits).map_err(|_| PbcError::TooManyQubits)?;
     for (index, gate) in circuit.gates.iter().enumerate() {
         let validation_gate = match gate {
-            Gate::rz(a, q) if a.quarter_turns().is_some() => Gate::z(*q),
+            Gate::rz(a, q) if a.projective_quarters().is_some() => Gate::z(*q),
             _ => gate.clone(),
         };
         validate(circuit, &validation_gate).map_err(|cause| PbcError::InvalidInput {

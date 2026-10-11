@@ -85,9 +85,13 @@ fn phase(gate: &Gate) -> Option<(u32, Phase)> {
         Gate::sdg(q) => (*q, -2),
         Gate::z(q) => (*q, 4),
         Gate::rz(angle, q) | Gate::p(angle, q) => {
-            if let Some((pi, residual)) = angle.components() {
-                p.pi = BigRational::new(pi.numerator().into(), pi.denominator().into());
-                p.radians = binary(residual.get());
+            if let Some((pi, residual)) = angle.affine_coefficients() {
+                p.pi = pi.to_big_rational();
+                p.radians = if let Some(f) = angle.to_f64_exact() {
+                    binary(f)
+                } else {
+                    residual.to_big_rational()
+                };
             } else {
                 p.opaque.insert(angle.to_string(), 1.into());
             }
@@ -238,12 +242,11 @@ pub fn semantics(circuit: &Circuit) -> Vec<(usize, Phase)> {
                         control,
                         target,
                     } => {
-                        let (pi, residual) = lambda
-                            .components()
-                            .expect("oracle needs accepted components");
+                        let (pi, residual) =
+                            lambda.affine_coefficients().expect("affine oracle domain");
                         let mut angle = Phase::zero();
-                        angle.pi = BigRational::new(pi.numerator().into(), pi.denominator().into());
-                        angle.radians = binary(residual.get());
+                        angle.pi = pi.to_big_rational();
+                        angle.radians = residual.to_big_rational();
                         if bit(*control) {
                             if matches!(gate, Gate::crz { .. }) {
                                 let factor = BigRational::new(

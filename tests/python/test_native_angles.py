@@ -3,7 +3,7 @@ import pennylane as qml
 import pytest
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import Operator
-from tzap._angles import angle_radians
+from tzap._angles import angle_radians, exact_float_expression
 from tzap.pennylane import optimize as optimize_tape
 from tzap.qiskit import optimize
 
@@ -248,7 +248,7 @@ def test_controlled_synthesis_matches_independent_high_precision_matrix(
 
 @pytest.mark.parametrize("axis", ["cp", "crx", "cry", "crz"])
 @pytest.mark.parametrize("numerator", [1, -1])
-def test_synthesis_handles_pi_coefficients_whose_half_cannot_fit_angle(axis, numerator):
+def test_synthesis_promotes_pi_coefficients_when_halved(axis, numerator):
     from fractions import Fraction
 
     from precision_reference import (
@@ -308,7 +308,7 @@ def test_sdk_exact_export_preserves_mixed_controlled_angles(axis, reverse, value
     from tzap import _native
 
     bits = [1, 0] if reverse else [0, 1]
-    source = f"qreg q[2]; {axis}((pi/2)+({value!r})) q[{bits[0]}],q[{bits[1]}];"
+    source = f"qreg q[2]; {axis}((pi/2)+({exact_float_expression(value)})) q[{bits[0]}],q[{bits[1]}];"
     output = qasm_operations(_native._sdk_qasm(source))
     # Same-axis factors define the reference without adding pi to a float.
     expected = matrix(

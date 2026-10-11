@@ -47,11 +47,7 @@ fn residual_sum(c: &Circuit) -> BigRational {
     c.gates
         .iter()
         .map(|g| match g {
-            Gate::rz(a, _) => {
-                let (p, r) = a.components().unwrap();
-                assert_eq!(p.numerator(), 0);
-                binary(r.get())
-            }
+            Gate::rz(a, _) => a.as_rational().expect("numeric rotation").to_big_rational(),
             _ => panic!("numeric rotation must not become a named pi rotation: {g:?}"),
         })
         .sum()
@@ -81,12 +77,28 @@ fn finite_inputs_and_fraction_boundaries() {
         i64::MAX
     );
     assert_eq!(
-        Angle::pi_fraction(i64::MIN, 1).unwrap().quarter_turns(),
+        Angle::pi_fraction(i64::MIN, 1)
+            .unwrap()
+            .quarter_turns(tzap::symbolic_angle::RotationPeriod::TwoPi),
         Some(0)
     );
-    assert_eq!(numeric(std::f64::consts::PI / 4.0).quarter_turns(), None);
-    assert_eq!(Angle::pi_fraction(1, 4).unwrap().quarter_turns(), Some(1));
-    assert_eq!(Angle::pi_fraction(1, 7).unwrap().quarter_turns(), None);
+    assert_eq!(
+        numeric(std::f64::consts::PI / 4.0)
+            .quarter_turns(tzap::symbolic_angle::RotationPeriod::TwoPi),
+        None
+    );
+    assert_eq!(
+        Angle::pi_fraction(1, 4)
+            .unwrap()
+            .quarter_turns(tzap::symbolic_angle::RotationPeriod::TwoPi),
+        Some(1)
+    );
+    assert_eq!(
+        Angle::pi_fraction(1, 7)
+            .unwrap()
+            .quarter_turns(tzap::symbolic_angle::RotationPeriod::TwoPi),
+        None
+    );
     for (n, d) in [
         (i64::MIN, 1),
         (i64::MIN, i64::MAX),
@@ -190,24 +202,16 @@ fn parsing_pi_context_mixed_limits_fallback_and_multiline() {
         let roundtrip = qasm::parse(&c.to_qasm()).unwrap();
         assert_eq!(roundtrip.gates, c.gates);
     }
-    let c = qasm::parse("qreg q[1]; rz(pi/4+0.3) q[0];").unwrap();
-    let Gate::rz(a, _) = &c.gates[0] else {
-        panic!()
-    };
-    assert_eq!(a.components().unwrap().0, PiFraction::new(1, 4).unwrap());
-    assert_eq!(a.components().unwrap().1.get(), 0.3);
-    let output = c.to_qasm();
-    assert!(output.contains("pi"));
-    assert_eq!(qasm::parse(&output).unwrap().gates.len(), 2);
-    let preserved = qasm::parse("qreg q[1]; rz(pi/9223372036854775808) q[0];").unwrap();
-    assert!(matches!(&preserved.gates[0],Gate::rz(a,_) if a.is_preserved()));
-    assert!(preserved.to_qasm().contains("pi/9223372036854775808"));
-    let c = qasm::parse("qreg q[1]; rz(pi*pi/4) q[0];").unwrap();
-    assert!(matches!(&c.gates[0],Gate::rz(a,_) if a.used_numeric_fallback()));
-    assert!(qasm::parse("qreg q[1]; rz((1/0)-(1/0)) q[0];").is_err());
-    assert!(qasm::parse("qreg q[1]; rz((1/0)*pi) q[0];").is_err());
-    let c = qasm::parse("qreg q[1]; rz(0.1+0.2) q[0];").unwrap();
-    assert!(matches!(&c.gates[0],Gate::rz(a,_) if a.components().unwrap().1.get()==0.1+0.2));
+    let mut ctx = tzap::angle::AngleContext::default();
+    for expression in ["pi/4+0.3", "pi/9223372036854775808", "pi*pi/4", "0.1+0.2"] {
+        let c = qasm::parse(&format!("qreg q[1]; rz({expression}) q[0];")).unwrap();
+        assert_eq!(c.gates[0].angle().unwrap(), &ctx.parse(expression).unwrap());
+        assert!(!c.gates[0].angle().unwrap().used_numeric_fallback());
+        assert_eq!(qasm::parse(&c.to_qasm()).unwrap().gates, c.gates);
+    }
+    for expression in ["(1/0)-(1/0)", "(1/0)*pi"] {
+        assert!(qasm::parse(&format!("qreg q[1]; rz({expression}) q[0];")).is_err());
+    }
 }
 #[test]
 fn every_numeric_folder_preserves_known_audit_regressions() {
@@ -275,7 +279,7 @@ fn exact_pi_and_long_named_sequences() {
             .run(&c)
             .gates
             .iter()
-            .any(|g| matches!(g,Gate::rz(a,_) if a.components().unwrap().1.get()==5e-7))
+            .any(|g| matches!(g,Gate::rz(a,_) if a.affine_coefficients().is_some_and(|(_,r)|r.to_big_rational()==BigRational::new(5.into(),10000000.into()))))
     );
 }
 #[test]
@@ -291,7 +295,7 @@ fn reports_separate_rounding_and_random_matching_in_serial_and_parallel() {
         assert_eq!(residual_sum(&out), residual_sum(&input));
         assert!(report.numerical.randomized_matching);
         if !parallel {
-            assert!(report.numerical.skipped_rounded_folds > 0);
+            assert_eq!(report.numerical.skipped_rounded_folds, 0);
         }
     }
 }
@@ -314,7 +318,7 @@ fn synthesis_errors_and_exact_lowering() {
         passes: Some(vec![PassName::DecomposeRz]),
         ..Options::default()
     };
-    assert!(optimize(&preserved, &options).is_err());
+    assert!(optimize(&preserved, &options).is_ok());
     let exact = qasm::parse("qreg q[1]; rz(pi/4) q[0];").unwrap();
     let (out, report) = optimize(&exact, &options).unwrap();
     assert_eq!(out.gates, vec![Gate::t(0)]);
@@ -337,10 +341,13 @@ fn synthesis_errors_and_exact_lowering() {
 #[test]
 fn parser_complexity_is_bounded_without_changing_normal_expressions() {
     let nested = format!("{}pi{}", "(".repeat(200), ")".repeat(200));
-    let chain = vec!["pi"; 300].join("+");
+    let chain = (1..=300)
+        .map(|n| format!("sin({n}/1000)"))
+        .collect::<Vec<_>>()
+        .join("+");
     for expression in [nested, chain] {
         let error = qasm::parse(&format!("qreg q[1]; rz({expression}) q[0];")).unwrap_err();
-        assert!(error.to_string().contains("complexity limit"));
+        assert!(error.to_string().contains("resource limit"));
     }
     assert!(qasm::parse("qreg q[1]; rz((((2*pi)/3))) q[0];").is_ok());
 }
@@ -354,13 +361,8 @@ fn signed_failed_merges_and_coefficient_limits_are_transactional() {
             match gate {
                 Gate::x(_) => flip = !flip,
                 Gate::rz(angle, _) => {
-                    let (p, r) = angle.components().unwrap();
-                    assert_eq!(p.numerator(), 0);
-                    radians += if flip {
-                        -binary(r.get())
-                    } else {
-                        binary(r.get())
-                    };
+                    let r = angle.as_rational().unwrap().to_big_rational();
+                    radians += if flip { -r } else { r };
                 }
                 _ => panic!("unexpected numeric-axis operation"),
             }
@@ -393,7 +395,16 @@ fn signed_failed_merges_and_coefficient_limits_are_transactional() {
         &PhaseFoldPauli,
         &CnotMin::default(),
     ] {
-        assert_eq!(pass.run(&input).gates, input.gates, "{}", pass.name());
+        let output = pass.run(&input);
+        assert_eq!(output.gates.len(), 1, "{}", pass.name());
+        let Gate::rz(a, _) = &output.gates[0] else {
+            panic!("expected exact rotation")
+        };
+        assert_eq!(
+            a.pi_coefficient().unwrap().to_big_rational(),
+            BigRational::new(1.into(), i64::MAX.into())
+                + BigRational::new(1.into(), (i64::MAX - 1).into())
+        );
     }
 }
 
@@ -402,13 +413,21 @@ fn canonical_equality_hashing_layout_and_numeric_export() {
     use std::hash::{Hash, Hasher};
     let exact = Angle::pi_fraction(1, 4).unwrap();
     let equivalent = Angle::pi_fraction(9, 4).unwrap();
-    assert_eq!(exact, equivalent);
+    assert_ne!(exact, equivalent);
+    let mut ctx = tzap::angle::AngleContext::default();
+    let period = tzap::symbolic_angle::RotationPeriod::TwoPi;
+    assert_eq!(
+        ctx.rotation_view(&exact, period).unwrap(),
+        ctx.rotation_view(&equivalent, period).unwrap()
+    );
     let hash = |a: &Angle| {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         a.hash(&mut h);
         h.finish()
     };
-    assert_eq!(hash(&exact), hash(&equivalent));
+    assert_eq!(hash(&exact), hash(&exact.clone()));
+    assert_eq!(std::mem::size_of::<Angle>(), 16);
+    assert_eq!(std::mem::size_of::<Gate>(), 32);
     println!(
         "Angle: {} bytes; Gate: {} bytes",
         std::mem::size_of::<Angle>(),
@@ -416,13 +435,13 @@ fn canonical_equality_hashing_layout_and_numeric_export() {
     );
     let input = qasm::parse("qreg q[1]; rz(pi/7) q[0]; rz(pi/4) q[0]; rz(0.3) q[0];").unwrap();
     let export = qasm::serialize_numeric_lossy(&input).unwrap();
-    assert_eq!(export.uncertified_conversions, 1);
+    assert_eq!(export.uncertified_conversions, 2);
     assert!(!export.qasm.contains("pi"));
     assert!(export.qasm.contains("t q[0]"));
     assert!(
         qasm::serialize_numeric_lossy(
             &qasm::parse("qreg q[1]; rz(pi/9223372036854775808) q[0];").unwrap()
         )
-        .is_err()
+        .is_ok()
     );
 }

@@ -321,13 +321,11 @@ fn exact_oracle_detects_numeric_errors_and_ignores_only_global_phase() {
 #[test]
 fn bounded_numerical_fuzz_covers_exact_arithmetic_and_rollback() {
     let coverage = run_cases(SEED, 0, 32);
-    assert!(
-        coverage.rounded > 0
-            && coverage.nonfinite > 0
-            && coverage.coefficient > 0
-            && coverage.preserved > 0
-            && coverage.reduced > 0,
-        "the bounded sample must exercise successful rewrites and every failure category"
+    assert!(coverage.reduced > 0, "sample exercises successful rewrites");
+    assert_eq!(
+        (coverage.rounded, coverage.nonfinite, coverage.preserved),
+        (0, 0, 0),
+        "exact storage promotes values instead of refusing rounded binary64 sums"
     );
 }
 

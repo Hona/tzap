@@ -393,7 +393,7 @@ fn native_serialization_uses_qasm2_library_operations() {
             Gate::swap(0, 1),
         ],
     );
-    let output = input.to_qasm();
+    let output = crate::qasm::serialize_sdk(&input).unwrap();
     for operation in [
         "u1(0.37) q[0];",
         "y q[1];",

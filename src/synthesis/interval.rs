@@ -5,7 +5,7 @@ use num_integer::Integer;
 use num_traits::{Signed, Zero};
 
 #[derive(Clone, Debug)]
-pub(super) struct Interval {
+pub(crate) struct Interval {
     pub lo: BigInt,
     pub hi: BigInt,
 }
@@ -63,7 +63,7 @@ impl Interval {
     }
 }
 
-pub(super) struct Context {
+pub(crate) struct Context {
     pub bits: usize,
     pub unit: BigInt,
 }
@@ -214,6 +214,25 @@ impl Complex {
         let re = self.re.sub(&other.re).abs_upper();
         let im = self.im.sub(&other.im).abs_upper();
         &re * &re + &im * &im
+    }
+    pub fn difference_square_bounds(&self, other: &Self) -> (BigInt, BigInt) {
+        let re = self.re.sub(&other.re);
+        let im = self.im.sub(&other.im);
+        let minimum = |x: &Interval| {
+            if x.lo > BigInt::zero() {
+                x.lo.clone()
+            } else if x.hi < BigInt::zero() {
+                -&x.hi
+            } else {
+                BigInt::zero()
+            }
+        };
+        let (re_lo, im_lo) = (minimum(&re), minimum(&im));
+        let (re_hi, im_hi) = (re.abs_upper(), im.abs_upper());
+        (
+            &re_lo * &re_lo + &im_lo * &im_lo,
+            &re_hi * &re_hi + &im_hi * &im_hi,
+        )
     }
 }
 

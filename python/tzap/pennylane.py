@@ -8,7 +8,7 @@ from collections.abc import Iterable, Sequence
 import pennylane as qml
 from pennylane.tape import QuantumScript
 
-from ._angles import angle_radians, sdk_qasm
+from ._angles import angle_radians, exact_float_expression, sdk_qasm
 from ._core import optimize_qasm
 
 
@@ -176,7 +176,9 @@ def _tape_to_qasm(
             )
         operands = ",".join(f"q[{wire_indices[wire]}]" for wire in operation_wires)
         if name in ("rz", "rx", "ry", "p", "cp", "crx", "cry", "crz"):
-            lines.append(f"{name}({_concrete_angle(operation)!r}) {operands};")
+            lines.append(
+                f"{name}({exact_float_expression(_concrete_angle(operation))}) {operands};"
+            )
         else:
             lines.append(f"{name} {operands};")
 

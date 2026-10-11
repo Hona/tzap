@@ -122,6 +122,116 @@ fn full_controlled_verifier_detects_lost_branch_phase() {
 }
 
 #[test]
+fn complex_distance_bounds_include_zero_crossings_and_negative_components() {
+    let other = Complex {
+        re: Interval::point(1.into()),
+        im: Interval::point((-1).into()),
+    };
+    for re in -4i64..=4 {
+        for im in -4i64..=4 {
+            let rectangle = Complex {
+                re: Interval {
+                    lo: re.into(),
+                    hi: (re + 3).into(),
+                },
+                im: Interval {
+                    lo: im.into(),
+                    hi: (im + 3).into(),
+                },
+            };
+            // The extrema of this integer-endpoint rectangle occur at an
+            // endpoint or zero; exhaust its integer grid independently.
+            let values: Vec<_> = (re..=re + 3)
+                .flat_map(|r| (im..=im + 3).map(move |i| (r - 1).pow(2) + (i + 1).pow(2)))
+                .collect();
+            let (lower, upper) = rectangle.difference_square_bounds(&other);
+            assert_eq!(lower, BigInt::from(*values.iter().min().unwrap()));
+            assert_eq!(upper, BigInt::from(*values.iter().max().unwrap()));
+        }
+    }
+}
+
+#[test]
+fn controlled_symbolic_synthesis_retries_target_preparation() {
+    use crate::{decompose::DecomposeRotations, qasm, unitary::circuits_equiv};
+    // Independent mpmath fixtures at 500 decimal digits, reduced modulo 4*pi.
+    // Never evaluate these huge intermediate arguments through binary64.
+    for (source, reduced) in [
+        ("exp(256)", "3.792252811227286521400825"),
+        ("sin(exp(256))", "-0.6057118146249979501423651"),
+        ("cos(exp(256))", "-0.7956841066803409008225726"),
+    ] {
+        let angle = crate::angle::AngleContext::default().parse(source).unwrap();
+        assert!(prepare_with_period(&angle, 209, 4).is_err());
+        for family in ["cp", "crx", "cry", "crz"] {
+            for operands in ["q[0],q[1]", "q[1],q[0]"] {
+                let input =
+                    qasm::parse(&format!("qreg q[2]; {family}({source}) {operands};")).unwrap();
+                let reference =
+                    qasm::parse(&format!("qreg q[2]; {family}({reduced}) {operands};")).unwrap();
+                let output = DecomposeRotations { epsilon: 1e-5 }
+                    .try_run(&input)
+                    .unwrap();
+                assert!(output.gates.iter().all(|g| g.angle().is_none()));
+                assert!(
+                    circuits_equiv(&reference, &output, 1e-5),
+                    "{family}({source}) {operands}"
+                );
+                assert!(verify_controlled(&input.gates[0], &[Gate::z(0)], 1e-5).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn controlled_verifier_retries_inconclusive_distance_and_rejects_wrong_words() {
+    use crate::{decompose::DecomposeRotations, qasm, unitary::circuits_equiv};
+    let input = qasm::parse("qreg q[2]; crz(exp(128)) q[1],q[0];").unwrap();
+    let angle = input.gates[0].angle().unwrap();
+    let output = DecomposeRotations { epsilon: 1e-5 }
+        .try_run(&input)
+        .unwrap();
+    let exact = controlled_word(&output.gates, 1, 0).unwrap();
+    // Preparation succeeds at the initial precision, but the distance bound
+    // remains too wide. This exercises retries after candidate evaluation.
+    assert!(matches!(
+        verify_controlled_at_precision(&input.gates[0], angle, &exact, 1e-5, 209).unwrap(),
+        ControlledVerification::Inconclusive
+    ));
+    verify_controlled(&input.gates[0], &output.gates, 1e-5).unwrap();
+    let reference = qasm::parse("qreg q[2]; crz(3.943723543226126377318808) q[1],q[0];").unwrap();
+    assert!(circuits_equiv(&reference, &output, 1e-5));
+
+    let wrong = qasm::parse("qreg q[2]; crz(pi) q[1],q[0];").unwrap();
+    let angle = wrong.gates[0].angle().unwrap();
+    assert!(matches!(
+        verify_controlled_at_precision(
+            &wrong.gates[0],
+            angle,
+            &exact_word::ExactWord::identity(),
+            1e-5,
+            209
+        )
+        .unwrap(),
+        ControlledVerification::Rejected
+    ));
+}
+
+#[test]
+fn controlled_symbolic_synthesis_still_fails_at_resource_limits() {
+    use crate::{decompose::DecomposeRotations, pass::Pass, qasm};
+    let input = qasm::parse("qreg q[2]; crz(sin(exp(1025))) q[1],q[0];").unwrap();
+    let pass = DecomposeRotations { epsilon: 1e-5 };
+    assert!(
+        pass.try_run(&input)
+            .unwrap_err()
+            .to_string()
+            .contains("symbolic target could not be enclosed")
+    );
+    assert_eq!(pass.run(&input).gates, input.gates);
+}
+
+#[test]
 fn numerical_limits_fail_without_accepting_unverified_output() {
     assert!(
         synthesize(&Angle::from_f64(1.0).unwrap(), 1e-100)
@@ -196,7 +306,14 @@ fn tiny_hadamard_rotation_is_preserved_by_each_exact_pass() {
 #[test]
 fn exact_scaled_targets_enclose_unrepresentable_halves() {
     let tiny = Angle::from_f64(f64::from_bits(1)).unwrap();
-    assert!(tiny.checked_half().is_err());
+    assert_eq!(
+        tiny.checked_half()
+            .unwrap()
+            .as_rational()
+            .unwrap()
+            .to_big_rational(),
+        BigRational::new(1.into(), BigInt::from(1) << 1075usize)
+    );
     let bits = 1200;
     let target = prepare_scaled_with_period(&tiny, bits, 2, Scale::Half).unwrap();
     let expected = BigRational::new(1.into(), BigInt::from(1) << 1075usize);
@@ -206,7 +323,15 @@ fn exact_scaled_targets_enclose_unrepresentable_halves() {
     assert!(rational_endpoint(&negative.reduced.lo, &negative.ctx) <= -expected.clone());
     assert!(rational_endpoint(&negative.reduced.hi, &negative.ctx) >= -expected);
     let fraction = Angle::pi_fraction(1, i64::MAX).unwrap();
-    assert!(fraction.checked_half().is_err());
+    assert_eq!(
+        fraction
+            .checked_half()
+            .unwrap()
+            .pi_coefficient()
+            .unwrap()
+            .to_big_rational(),
+        BigRational::new(1.into(), BigInt::from(i64::MAX) * 2)
+    );
     let target = prepare_scaled_with_period(&fraction, 512, 2, Scale::Half).unwrap();
     let pi = target.ctx.pi();
     let denominator = BigInt::from(i64::MAX) * 2;

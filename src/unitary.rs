@@ -250,17 +250,64 @@ fn gate_matrix_sx() -> [[C; 2]; 2] {
 // phases separately. Converting their sum to one float can erase a quarter turn
 // and make the oracle agree with the same bug in an SDK adapter.
 fn angle_phase(angle: &crate::angle::Angle, half: bool) -> C {
-    let (pi, residual) = angle
-        .components()
-        .expect("test oracle requires accepted angle components");
-    let period = if half { 4 } else { 2 };
-    let numerator = pi.numerator() as i128 % (period * pi.denominator() as i128);
-    let divisor = if half { 2.0 } else { 1.0 };
-    let symbolic = C::polar(
-        1.0,
-        (numerator as f64 / pi.denominator() as f64) * PI / divisor,
-    );
-    symbolic * C::polar(1.0, residual.get() / divisor)
+    use crate::symbolic_angle::{Function, view::ExpressionRef};
+    use num_traits::ToPrimitive;
+    fn number(r: &crate::symbolic_angle::Rational) -> f64 {
+        r.to_big_rational()
+            .to_f64()
+            .expect("finite reference scalar")
+    }
+    fn reference(a: &crate::angle::Angle) -> f64 {
+        match a.expression() {
+            ExpressionRef::Rational(r) => number(&r),
+            ExpressionRef::Pi(r) => number(&r) * PI,
+            ExpressionRef::Sum(terms) => terms.map(|(c, a)| number(c) * reference(a)).sum(),
+            ExpressionRef::Product {
+                coefficient,
+                factors,
+            } => number(coefficient) * factors.iter().map(reference).product::<f64>(),
+            ExpressionRef::Quotient(a, b) => reference(a) / reference(b),
+            ExpressionRef::Power(a, n) => reference(a).powf(n as f64),
+            ExpressionRef::Function(f, a) => {
+                let x = reference(a);
+                match f {
+                    Function::Sin => x.sin(),
+                    Function::Cos => x.cos(),
+                    Function::Tan => x.tan(),
+                    Function::Exp => x.exp(),
+                    Function::Ln => x.ln(),
+                    Function::Sqrt => x.sqrt(),
+                }
+            }
+        }
+    }
+    fn phase_of(a: &crate::angle::Angle, scale: &num_rational::BigRational, half: bool) -> C {
+        let divisor = if half { 2.0 } else { 1.0 };
+        match a.expression() {
+            ExpressionRef::Pi(p) => {
+                let r = p.to_big_rational() * scale;
+                let period = if half { 4 } else { 2 };
+                let n = r.numer() % (r.denom() * period);
+                C::polar(
+                    1.0,
+                    num_rational::BigRational::new(n, r.denom().clone())
+                        .to_f64()
+                        .unwrap()
+                        * PI
+                        / divisor,
+                )
+            }
+            ExpressionRef::Sum(terms) => terms.fold(C::ONE, |phase, (c, a)| {
+                phase * phase_of(a, &(scale * c.to_big_rational()), half)
+            }),
+            _ => C::polar(1.0, reference(a) * scale.to_f64().unwrap() / divisor),
+        }
+    }
+    phase_of(
+        angle,
+        &num_rational::BigRational::from_integer(1.into()),
+        half,
+    )
 }
 fn gate_matrix_p(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
     [[C::ONE, C::ZERO], [C::ZERO, angle_phase(theta, false)]]

@@ -274,7 +274,7 @@ pub(crate) fn circuit_channel(
                 splits += 1;
                 destinations.insert(*cbit);
             }
-            Gate::rz(angle, _) if angle.quarter_turns().is_some() => (),
+            Gate::rz(angle, _) if angle.projective_quarters().is_some() => (),
             Gate::reset(_) => splits += 1,
             Gate::rz(..) => return Err(Error::UnsupportedOperation { index }),
             Gate::p(..)
