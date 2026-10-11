@@ -169,8 +169,15 @@ impl FiniteF64 {
         if !value.is_finite() {
             Err(AngleError::NonFinite)
         } else {
-            Ok(Self(if value == 0.0 { 0.0 } else { value }))
+            Ok(Self(if value.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
+                0.0
+            } else {
+                value
+            }))
         }
+    }
+    fn is_zero(self) -> bool {
+        self.0.to_bits() == 0
     }
     pub fn get(self) -> f64 {
         self.0
@@ -197,11 +204,63 @@ pub fn exact_float_add(a: FiniteF64, b: FiniteF64) -> Result<FiniteF64, AngleErr
     let br = FiniteF64::new(b.0 - bb)?.0;
     let ar = FiniteF64::new(a.0 - aa)?.0;
     let correction = FiniteF64::new(ar + br)?.0;
-    if correction != 0.0 {
+    if correction != 0.0 || !float_sum_matches_bits(a.0, b.0, s) {
         Err(AngleError::RoundedAddition)
     } else {
         FiniteF64::new(s)
     }
+}
+
+/// Independent, allocation-free representability check. TwoSum's fast test
+/// must never certify a rounded result under altered rounding/underflow modes.
+/// Exponent gaps beyond 74 cannot yield a representable sum of two nonzero
+/// binary64 values: the smaller significand is too far below the larger one.
+fn float_sum_matches_bits(a: f64, b: f64, sum: f64) -> bool {
+    fn decode(value: f64) -> (bool, u128, i32) {
+        let bits = value.to_bits();
+        let exponent = ((bits >> 52) & 2047) as i32;
+        let fraction = bits & ((1 << 52) - 1);
+        (
+            bits >> 63 != 0,
+            (fraction | if exponent == 0 { 0 } else { 1 << 52 }) as u128,
+            if exponent == 0 {
+                -1074
+            } else {
+                exponent - 1075
+            },
+        )
+    }
+    fn normalized(negative: bool, mantissa: u128, exponent: i32) -> (bool, u128, i32) {
+        if mantissa == 0 {
+            return (false, 0, 0);
+        }
+        let shift = mantissa.trailing_zeros();
+        (negative, mantissa >> shift, exponent + shift as i32)
+    }
+    let (an, am, ae) = decode(a);
+    let (bn, bm, be) = decode(b);
+    let (sn, sm, se) = decode(sum);
+    let actual = normalized(sn, sm, se);
+    if am == 0 {
+        return actual == normalized(bn, bm, be);
+    }
+    if bm == 0 {
+        return actual == normalized(an, am, ae);
+    }
+    let exponent = ae.min(be);
+    let (ashift, bshift) = ((ae - exponent) as u32, (be - exponent) as u32);
+    if ashift.max(bshift) > 74 {
+        return false;
+    }
+    let (am, bm) = (am << ashift, bm << bshift);
+    let (negative, magnitude) = if an == bn {
+        (an, am + bm)
+    } else if am >= bm {
+        (an, am - bm)
+    } else {
+        (bn, bm - am)
+    };
+    actual == normalized(negative, magnitude, exponent)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -267,7 +326,7 @@ impl Angle {
     pub(crate) fn checked_half(&self) -> Result<Self, AngleError> {
         let (pi, r) = self.components().ok_or(AngleError::PreservedExpression)?;
         let half = r.get() / 2.0;
-        if half * 2.0 != r.get() {
+        if !float_sum_matches_bits(half, half, r.get()) {
             return Err(AngleError::RoundedAddition);
         }
         Ok(Self::affine(
@@ -324,14 +383,14 @@ impl Angle {
         match &self.0 {
             Value::Turns(k) => Some(*k),
             Value::Float(r) | Value::NumericFallback(r) => {
-                if r.get() == 0.0 {
+                if r.is_zero() {
                     Some(0)
                 } else {
                     None
                 }
             }
             Value::Symbolic(s) => match &**s {
-                Symbolic::Affine { pi, radians } if radians.get() == 0.0 => pi.quarter_turns(),
+                Symbolic::Affine { pi, radians } if radians.is_zero() => pi.quarter_turns(),
                 _ => None,
             },
         }
@@ -371,7 +430,7 @@ impl Angle {
         let pi = a
             .checked_add(b.normalized_rotation())?
             .normalized_rotation();
-        let radians = exact_float_add(FiniteF64(sign as f64 * ar.0), br)?;
+        let radians = exact_float_add(FiniteF64(if sign < 0 { -ar.0 } else { ar.0 }), br)?;
         Ok(Self::affine(pi, radians))
     }
     pub fn normalized(&self) -> Self {
@@ -384,7 +443,7 @@ impl Angle {
         match self.components() {
             Some((p, r)) => {
                 let p = p.normalized_rotation();
-                if r.0 == 0.0 {
+                if r.is_zero() {
                     if let Some(k) = p.quarter_turns() {
                         return Self::turns(k);
                     }
@@ -407,7 +466,7 @@ impl Angle {
             Some(3 | 5) => 2,
             Some(_) => 1,
             None => match self.components() {
-                Some((pi, r)) if pi.numerator() != 0 && r.get() != 0.0 => {
+                Some((pi, r)) if pi.numerator() != 0 && !r.is_zero() => {
                     Self::affine(pi, FiniteF64(0.0)).emitted_gate_count() + 1
                 }
                 _ => 1,
@@ -425,7 +484,7 @@ impl Angle {
             Some(6) => push(Gate::sdg(q)),
             Some(7) => push(Gate::tdg(q)),
             _ => match self.components() {
-                Some((pi, r)) if pi.numerator != 0 && r.0 != 0.0 => {
+                Some((pi, r)) if pi.numerator != 0 && !r.is_zero() => {
                     Self::affine(pi.normalized_rotation(), FiniteF64(0.0)).try_emit(q, push)
                         && push(Gate::rz(Self(Value::Float(r)), q))
                 }
@@ -471,7 +530,7 @@ impl fmt::Display for Angle {
             return write!(f, "{}", real_token(r.0));
         }
         write!(f, "({}*pi/{})", pi.numerator, pi.denominator)?;
-        if r.0 != 0.0 {
+        if !r.is_zero() {
             write!(f, "+({})", real_token(r.0))?;
         }
         Ok(())
@@ -514,5 +573,30 @@ pub(crate) fn lowered_if_needed(circuit: &Circuit) -> std::borrow::Cow<'_, Circu
         std::borrow::Cow::Owned(lower_exact_rotations(circuit))
     } else {
         std::borrow::Cow::Borrowed(circuit)
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_guard_tests {
+    use super::float_sum_matches_bits;
+
+    #[test]
+    fn integer_guard_rejects_flushed_and_rounded_candidate_sums() {
+        // Exercise altered-environment results directly, without mutating the
+        // process floating-point environment used by concurrent tests.
+        let tiny = f64::from_bits(1);
+        assert!(!float_sum_matches_bits(tiny, tiny, 0.0));
+        assert!(!float_sum_matches_bits(
+            tiny,
+            f64::from_bits((1 << 63) | 2),
+            0.0
+        ));
+        assert!(float_sum_matches_bits(tiny, tiny, f64::from_bits(2)));
+        assert!(float_sum_matches_bits(tiny, -tiny, -0.0));
+        for rounded in [1e16, f64::from_bits(1e16_f64.to_bits() + 1)] {
+            assert!(!float_sum_matches_bits(1e16, 1.0, rounded));
+        }
+        assert!(!float_sum_matches_bits(0.1, 0.2, 0.3));
+        assert!(float_sum_matches_bits(0.125, 0.25, 0.375));
     }
 }

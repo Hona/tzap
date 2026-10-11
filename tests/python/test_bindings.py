@@ -409,9 +409,13 @@ def test_no_float_pi_inference_or_rounded_folding():
     assert result.report.output.t == 0
 
 
-def test_explicit_synthesis_reports_uncertified_total_error():
+def test_explicit_synthesis_reports_certified_accepted_angle_error():
     result = tzap.optimize_qasm(
         make_qasm("rz(pi/7) q[0];"), passes=["DecomposeRz"], rz_epsilon=1e-5
     )
-    assert result.report.numerical.uncertified_syntheses == 1
-    assert "uncertified" in result.report.numerical.synthesis_error_scope
+    assert result.report.numerical.uncertified_syntheses == 0
+    assert result.report.numerical.certified_syntheses == 1
+    assert result.report.numerical.certified_error_bound >= 1e-5
+    assert (
+        "accepted_angle_per_input_gate" in result.report.numerical.synthesis_error_scope
+    )

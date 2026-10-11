@@ -7,11 +7,11 @@ use crate::{
 use std::{
     cell::RefCell,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NumericalReport {
     pub preserved_expressions: usize,
     pub numerical_fallbacks: usize,
@@ -19,6 +19,11 @@ pub struct NumericalReport {
     pub skipped_nonfinite_folds: usize,
     pub skipped_coefficient_limit_folds: usize,
     pub uncertified_syntheses: usize,
+    /// Original input gates whose approximation was verified against accepted angles.
+    pub certified_syntheses: usize,
+    pub failed_certifications: usize,
+    /// Outward-rounded sum of synthesized input-gate bounds, or None on overflow.
+    pub certified_error_bound: Option<f64>,
     pub randomized_matching: bool,
 }
 #[derive(Default)]
@@ -26,7 +31,15 @@ pub(crate) struct Counters {
     rounded: AtomicUsize,
     nonfinite: AtomicUsize,
     coefficient: AtomicUsize,
-    synthesis: AtomicUsize,
+    certified: AtomicUsize,
+    failed: AtomicUsize,
+    bound: Mutex<Bound>,
+}
+struct Bound(Option<f64>);
+impl Default for Bound {
+    fn default() -> Self {
+        Self(Some(0.0))
+    }
 }
 thread_local! {static ACTIVE:RefCell<Option<Arc<Counters>>>=const{RefCell::new(None)};}
 pub(crate) fn current() -> Option<Arc<Counters>> {
@@ -56,20 +69,31 @@ pub(crate) fn failure(error: AngleError) {
         }
     });
 }
-pub(crate) fn synthesis() {
+pub(crate) fn certified_synthesis(bound: f64) {
     ACTIVE.with(|a| {
         if let Some(c) = a.borrow().as_ref() {
-            c.synthesis.fetch_add(1, Ordering::Relaxed);
+            c.certified.fetch_add(1, Ordering::Relaxed);
+            let mut sum = c.bound.lock().unwrap_or_else(|e| e.into_inner());
+            sum.0 = sum.0.and_then(|previous| {
+                let next = (previous + bound).next_up();
+                next.is_finite().then_some(next)
+            });
         }
     });
+}
+pub(crate) fn certification_failure() {
+    if let Some(c) = current() {
+        c.failed.fetch_add(1, Ordering::Relaxed);
+    }
 }
 impl NumericalReport {
     pub fn input(circuit: &Circuit, options: &Options) -> Self {
         let mut result = Self {
+            certified_error_bound: Some(0.0),
             randomized_matching: options
                 .passes
                 .as_ref()
-                .map_or(true, |passes| passes.contains(&PassName::PhaseFoldRand)),
+                .is_none_or(|passes| passes.contains(&PassName::PhaseFoldRand)),
             ..Self::default()
         };
         for gate in &circuit.gates {
@@ -85,7 +109,10 @@ impl NumericalReport {
             skipped_rounded_folds: c.rounded.load(Ordering::Relaxed),
             skipped_nonfinite_folds: c.nonfinite.load(Ordering::Relaxed),
             skipped_coefficient_limit_folds: c.coefficient.load(Ordering::Relaxed),
-            uncertified_syntheses: c.synthesis.load(Ordering::Relaxed),
+            uncertified_syntheses: 0,
+            certified_syntheses: c.certified.load(Ordering::Relaxed),
+            failed_certifications: c.failed.load(Ordering::Relaxed),
+            certified_error_bound: c.bound.lock().unwrap_or_else(|e| e.into_inner()).0,
             ..Self::input(circuit, options)
         }
     }

@@ -515,7 +515,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Synthesis(error) => write!(f, "Rz synthesis failed: {error}"),
+            Error::Synthesis(error) => write!(f, "rotation synthesis failed: {error}"),
             Error::SuperOpt(error) => write!(f, "failed to initialize SuperOpt: {error}"),
         }
     }
