@@ -8,7 +8,7 @@ from collections.abc import Iterable, Sequence
 import pennylane as qml
 from pennylane.tape import QuantumScript
 
-from ._angles import angle_radians
+from ._angles import angle_radians, sdk_qasm
 from ._core import optimize_qasm
 
 
@@ -319,7 +319,7 @@ def _optimize_transform(
     optimized_operations = [
         *global_phases,
         *_output_operations(
-            result.qasm,
+            sdk_qasm(result.qasm),
             wires,
             tuple(
                 operation

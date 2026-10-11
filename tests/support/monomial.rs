@@ -99,16 +99,64 @@ fn phase(gate: &Gate) -> Option<(u32, Phase)> {
     Some((q, p))
 }
 
+/// Independently recognize local basis changes that make RX/RY diagonal.
+fn diagonalize(gates: &[Gate]) -> Vec<Gate> {
+    let mut current = gates.to_vec();
+    loop {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < current.len() {
+            let rest = &current[i..];
+            if let [
+                Gate::h(a),
+                Gate::s(b),
+                Gate::ry(angle, c),
+                Gate::sdg(d),
+                Gate::h(e),
+                ..,
+            ] = rest
+            {
+                if a == b && b == c && c == d && d == e {
+                    out.push(Gate::rz(angle.clone(), *a));
+                    i += 5;
+                    continue;
+                }
+            }
+            if let [Gate::h(a), Gate::rx(angle, b), Gate::h(c), ..] = rest {
+                if a == b && b == c {
+                    out.push(Gate::rz(angle.clone(), *a));
+                    i += 3;
+                    continue;
+                }
+            }
+            if let [a, b, ..] = rest {
+                let inverse = matches!((a,b), (Gate::h(q), Gate::h(r)) | (Gate::s(q), Gate::sdg(r)) | (Gate::sdg(q), Gate::s(r)) if q == r);
+                if inverse {
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(current[i].clone());
+            i += 1;
+        }
+        if out.len() == current.len() {
+            return out;
+        }
+        current = out;
+    }
+}
+
 pub fn semantics(circuit: &Circuit) -> Vec<(usize, Phase)> {
     assert_eq!(circuit.num_cbits, 0);
     assert!(circuit.num_qubits <= 4);
     // Decode each phase once; the state interpreter only uses exact integers.
-    let phases: Vec<_> = circuit.gates.iter().map(phase).collect();
+    let gates = diagonalize(&circuit.gates);
+    let phases: Vec<_> = gates.iter().map(phase).collect();
     (0..1usize << circuit.num_qubits)
         .map(|input| {
             let mut bits = input;
             let mut accumulated = Phase::zero();
-            for (gate, p) in circuit.gates.iter().zip(&phases) {
+            for (gate, p) in gates.iter().zip(&phases) {
                 let bit = |q: u32| {
                     assert!((q as usize) < circuit.num_qubits);
                     bits & (1 << q) != 0

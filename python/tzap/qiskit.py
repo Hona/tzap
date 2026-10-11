@@ -12,7 +12,7 @@ from qiskit.dagcircuit import DAGCircuit
 from qiskit.transpiler import PassManager, TransformationPass
 from qiskit.transpiler.exceptions import TranspilerError
 
-from ._angles import angle_radians
+from ._angles import angle_radians, sdk_qasm
 from ._core import optimize_qasm
 
 _ARITIES = {
@@ -209,7 +209,7 @@ class TzapPass(TransformationPass):
         source_qasm = _dag_to_qasm(dag)
         original = dag_to_circuit(dag, copy_operations=False)
         result = optimize_qasm(source_qasm, **self._options)
-        rebuilt = _rebuild_on_original_bits(original, result.qasm)
+        rebuilt = _rebuild_on_original_bits(original, sdk_qasm(result.qasm))
         return circuit_to_dag(rebuilt, copy_operations=False)
 
 

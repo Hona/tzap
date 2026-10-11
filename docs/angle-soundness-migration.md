@@ -98,10 +98,14 @@ for limits and the [detailed design](numerical-accuracy-f64-design.md) for the
 arithmetic and validation rules.
 
 The numeric Qiskit and PennyLane input adapters continue to supply finite numeric
-angles. Pi fractions are never inferred from their floats. Mixed folds emit named
-quarter-turn gates plus numeric residuals, so those adapters do not introduce
-implicit symbolic-to-numeric conversion. Existing symbolic/trainable-input
-rejections remain in place.
+angles. Pi fractions are never inferred from their floats. Both output adapters
+now use the shared Rust `qasm::serialize_sdk` export to keep named quarter-turn
+gates separate from numeric residuals on every supported rotation axis. Their
+Python reconstruction accepts only finite numeric literals. Controlled branch
+phases are preserved, and symbolic angles without an exact numeric-parameter
+expansion fail instead of being silently rounded. Existing symbolic/trainable
+input rejections remain in place. The explicitly lossy export covers all eight
+angle-bearing gates and counts uncertified conversions per input gate.
 
 ## Diagnostics
 

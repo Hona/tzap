@@ -192,3 +192,76 @@ fn tiny_hadamard_rotation_is_preserved_by_each_exact_pass() {
         );
     }
 }
+
+#[test]
+fn exact_scaled_targets_enclose_unrepresentable_halves() {
+    let tiny = Angle::from_f64(f64::from_bits(1)).unwrap();
+    assert!(tiny.checked_half().is_err());
+    let bits = 1200;
+    let target = prepare_scaled_with_period(&tiny, bits, 2, Scale::Half).unwrap();
+    let expected = BigRational::new(1.into(), BigInt::from(1) << 1075usize);
+    assert!(rational_endpoint(&target.reduced.lo, &target.ctx) <= expected);
+    assert!(rational_endpoint(&target.reduced.hi, &target.ctx) >= expected);
+    let negative = prepare_scaled_with_period(&tiny, bits, 2, Scale::NegativeHalf).unwrap();
+    assert!(rational_endpoint(&negative.reduced.lo, &negative.ctx) <= -expected.clone());
+    assert!(rational_endpoint(&negative.reduced.hi, &negative.ctx) >= -expected);
+    let fraction = Angle::pi_fraction(1, i64::MAX).unwrap();
+    assert!(fraction.checked_half().is_err());
+    let target = prepare_scaled_with_period(&fraction, 512, 2, Scale::Half).unwrap();
+    let pi = target.ctx.pi();
+    let denominator = BigInt::from(i64::MAX) * 2;
+    let lower = rational_endpoint(&pi.lo, &target.ctx) / &denominator;
+    let upper = rational_endpoint(&pi.hi, &target.ctx) / &denominator;
+    assert!(rational_endpoint(&target.reduced.lo, &target.ctx) <= lower);
+    assert!(rational_endpoint(&target.reduced.hi, &target.ctx) >= upper);
+}
+
+#[test]
+fn scaled_synthesis_cache_keeps_literal_sign_and_scale() {
+    let angle = Angle::from_f64(0.7).unwrap();
+    // The decompose entry point normally holds the process-global backend lock.
+    let _guard = crate::decompose::GRIDSYNTH_BATCH_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for scale in [
+        Scale::Whole,
+        Scale::Half,
+        Scale::NegativeHalf,
+        Scale::Whole,
+        Scale::NegativeHalf,
+    ] {
+        let word = synthesize_scaled(&angle, scale, 1e-10).unwrap();
+        let target = prepare_scaled_with_period(&angle, 512, 2, scale).unwrap();
+        assert!(
+            interval::verifies(
+                &target.matrix,
+                &word,
+                &target.pi,
+                &target.ctx.float(1e-10),
+                &target.ctx
+            )
+            .unwrap()
+        );
+        let wrong = prepare_scaled_with_period(
+            &angle,
+            512,
+            2,
+            if scale == Scale::Whole {
+                Scale::Half
+            } else {
+                Scale::Whole
+            },
+        )
+        .unwrap();
+        assert!(
+            !interval::verifies(
+                &wrong.matrix,
+                &word,
+                &wrong.pi,
+                &wrong.ctx.float(1e-10),
+                &wrong.ctx
+            )
+            .unwrap()
+        );
+    }
+}

@@ -18,7 +18,14 @@ const MAX_BITS: usize = 2048;
 const MAX_WORD: usize = 8192;
 const MAX_ATTEMPTS: usize = 3;
 const MIN_EPSILON: f64 = 1e-80;
-type Cache = VecDeque<(Angle, u64, Vec<char>)>;
+/// Temporary exact scaling; never round or store a half in the public Angle IR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scale {
+    Whole,
+    Half,
+    NegativeHalf,
+}
+type Cache = VecDeque<(Angle, Scale, u64, Vec<char>)>;
 static VERIFIED_WORDS: OnceLock<Mutex<Cache>> = OnceLock::new();
 
 #[derive(Debug)]
@@ -48,10 +55,19 @@ struct Target {
     reduced: Interval,
     matrix: Matrix,
 }
+#[cfg(test)]
 fn prepare(angle: &Angle, bits: usize) -> Result<Target, Failure> {
-    prepare_with_period(angle, bits, 2)
+    prepare_scaled_with_period(angle, bits, 2, Scale::Whole)
 }
 fn prepare_with_period(angle: &Angle, bits: usize, period: i64) -> Result<Target, Failure> {
+    prepare_scaled_with_period(angle, bits, period, Scale::Whole)
+}
+fn prepare_scaled_with_period(
+    angle: &Angle,
+    bits: usize,
+    period: i64,
+    scale: Scale,
+) -> Result<Target, Failure> {
     let (pi_coefficient, residual) = angle
         .components()
         .ok_or("preserved angle expression cannot be synthesized")?;
@@ -62,6 +78,11 @@ fn prepare_with_period(angle: &Angle, bits: usize, period: i64) -> Result<Target
         .scale(&coefficient)
         .div_int(pi_coefficient.denominator() as u64)
         .add(&ctx.float(residual.get()));
+    let theta = match scale {
+        Scale::Whole => theta,
+        Scale::Half => theta.div_int(2),
+        Scale::NegativeHalf => theta.div_int(2).neg(),
+    };
     // Any integer quotient is valid. Enclose the subtraction with mathematical
     // pi; only require the resulting interval to be small enough for the kernel.
     let tau = pi.scale(&period.into());
@@ -247,18 +268,24 @@ fn dyadic(integer: &BigInt, bits: usize, precision: usize) -> FBig<HalfEven> {
 
 /// Returned words have independently verified projective spectral error <= eps.
 pub(crate) fn synthesize(angle: &Angle, epsilon: f64) -> Result<Vec<char>, Failure> {
+    synthesize_scaled(angle, Scale::Whole, epsilon)
+}
+pub(crate) fn synthesize_scaled(
+    angle: &Angle,
+    scale: Scale,
+    epsilon: f64,
+) -> Result<Vec<char>, Failure> {
     if epsilon < MIN_EPSILON {
         return Err(Failure::Limit(
             "certification precision limit: epsilon must be at least 1e-80",
         ));
     }
     let cache = VERIFIED_WORDS.get_or_init(|| Mutex::new(VecDeque::new()));
-    if let Some((_, _, word)) = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|(prior, bound, _)| prior.literal_eq(angle) && *bound == epsilon.to_bits())
-    {
+    if let Some((_, _, _, word)) = cache.lock().unwrap_or_else(|e| e.into_inner()).iter().find(
+        |(prior, prior_scale, bound, _)| {
+            prior.literal_eq(angle) && *prior_scale == scale && *bound == epsilon.to_bits()
+        },
+    ) {
         return Ok(word.clone());
     }
     let (_, residual) = angle
@@ -271,7 +298,7 @@ pub(crate) fn synthesize(angle: &Angle, epsilon: f64) -> Result<Vec<char>, Failu
     if bits > MAX_BITS {
         return Err(Failure::Limit("certification precision limit reached"));
     }
-    let target = prepare(angle, bits)?;
+    let target = prepare_scaled_with_period(angle, bits, 2, scale)?;
     let budget = target.ctx.float(epsilon.min(1.0));
     // Tiny rotations may be proved close to I without calling the synthesizer.
     if interval::verifies(&target.matrix, &[], &target.pi, &budget, &target.ctx)
@@ -313,7 +340,7 @@ pub(crate) fn synthesize(angle: &Angle, epsilon: f64) -> Result<Vec<char>, Failu
             if cache.len() == 64 {
                 cache.pop_front();
             }
-            cache.push_back((angle.clone(), epsilon.to_bits(), word.clone()));
+            cache.push_back((angle.clone(), scale, epsilon.to_bits(), word.clone()));
             return Ok(word);
         }
     }

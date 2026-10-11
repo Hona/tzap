@@ -9,6 +9,7 @@ __all__ = [
     "TzapError",
     "__version__",
     "_optimize_qasm",
+    "_sdk_qasm",
 ]
 
 def _optimize_qasm(
@@ -36,3 +37,4 @@ def _optimize_qasm(
         tuple[int, int, int, int, int, int, bool, int, int, float | None],
     ],
 ]: ...
+def _sdk_qasm(qasm: str) -> str: ...

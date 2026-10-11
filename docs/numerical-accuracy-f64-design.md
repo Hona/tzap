@@ -652,11 +652,14 @@ projective spectral norm. Controlled terms initially receive `epsilon/(4*n)`
 with a downward-rounded split; the final complete operator must still pass
 against the input gate's epsilon. Named-only lowering skips that numerical
 budget. Repeated unconditional targets reuse a bounded cache of 64 previously
-verified words, keyed by literal accepted angle and identical epsilon.
+verified words, keyed by literal accepted angle, exact temporary scale, and
+identical epsilon.
 
 Limits are 2,048 interval bits, 8,192 instructions per candidate word, and three
-candidate attempts. Approximate terms require epsilon at least `1e-80`; tighter
-controlled-term budgets can hit this limit before the input epsilon does. A
+candidate attempts. Terms sent to the synthesis backend require epsilon at least
+`1e-80`; tighter controlled-term budgets can hit this limit before the input
+epsilon does. Directly certified controlled identity candidates do not invoke the
+backend and can succeed at smaller epsilon within the interval precision limit. A
 limit or failed verification returns a typed internal failure, displayed through
 the existing public synthesis error with the input gate index and epsilon.
 There is no fallback to uncertified synthesis.
@@ -679,18 +682,43 @@ Rz/Y example and 600,000 gates for the P/X example. They run as explicit release
 stress tests; smaller versions also run in the normal suite. The independent
 rational phase interpreter is shared with the numerical stress fuzzer.
 
-Strict mathematical source evaluation and temporary unrepresentable controlled
-half-angle plans remain the separate future extensions described above.
+The boundary follow-up implements temporary exact half-angle plans for controlled
+synthesis without changing the public Angle representation. A scale-aware cache
+keeps whole, positive-half, and negative-half targets distinct. Direct identity
+candidates are verified against the complete original controlled operator; a
+nonidentity input approximated by identity is counted as certified synthesis even
+when its angle is a symbolic quarter turn.
+
+The same follow-up adds shared exact SDK export, complete explicitly lossy export,
+and independent 420-digit dense reference checks. SDK mixed-angle regressions
+cover all axes, large positive/negative values, maximum binary64 values, default
+serial/parallel pipelines, and controlled relative phases. The rational phase
+interpreter also recognizes diagonalized Rx/Ry basis sandwiches. The floating
+matrix helper now multiplies symbolic and numeric phase factors separately; it
+remains a floating helper, rather than an accuracy certificate.
+
+Strict mathematical source evaluation and verification of randomized Boolean
+matches remain separate future extensions.
 
 ### Validation results
 
-The full Rust suite and Python suite pass. Python reports 208 passed and one
-skipped. The release stress run also passes all 2,048 seeded numerical-fuzz
+The full Rust suite and Python suite pass after the boundary follow-up. Python
+reports 427 passed and one optional test skipped. The release stress run also
+passes all 2,048 seeded numerical-fuzz
 circuits and both full repeated-circuit regressions. The arithmetic guard tests
 exercise flushed and directed-rounded candidate results without changing the
 floating-point environment of other test threads. Python lint, formatting, and
 native stub checks pass. Strict Clippy still reports existing warnings in older
 modules; the new synthesis modules introduce none.
+
+The follow-up replayed all 158 QASM inputs in `tzap-superopt/benchmarks` through
+the release serial O3 pipeline with warm MURM caches. Every input and output
+metric matched the saved `origin/main` baseline. This one-run regression replay
+took 98.30 seconds including process startup; it is not a repeated performance
+comparison. Dedicated CLI checks also passed 24 synthesis inputs, including
+large angles, subnormals, unrepresentable rational halves, and controlled full
+turns. Two requests below the backend precision floor were refused without
+writing an output circuit.
 
 A local release CLI smoke benchmark used one run per input, with parsing and
 process startup included. These figures are observations on the development

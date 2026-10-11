@@ -127,7 +127,7 @@ pub type DecomposeRz = DecomposeRotations;
 
 // rsgridsynth stores working precision in process-global state. Serialize
 // configuration and synthesis so one call cannot change another's precision.
-static GRIDSYNTH_BATCH_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static GRIDSYNTH_BATCH_LOCK: Mutex<()> = Mutex::new(());
 
 impl Default for DecomposeRotations {
     fn default() -> Self {
@@ -188,35 +188,8 @@ impl DecomposeRotations {
             .enumerate()
             .map(|(index, gate)| {
                 let result = (|| {
-                    if let Some(terms) = expand_controlled_rotation(gate)? {
-                        let count = terms
-                            .iter()
-                            .filter(|g| matches!(g, Gate::rz(..) | Gate::p(..)))
-                            .count();
-                        let approximate = terms
-                            .iter()
-                            .any(|g| g.angle().is_some_and(|a| a.quarter_turns().is_none()));
-                        let term_epsilon = if approximate {
-                            (epsilon / (4 * count) as f64).next_down()
-                        } else {
-                            epsilon
-                        };
-                        if term_epsilon <= 0.0 {
-                            return Err(SynthesisError(
-                                "rotation synthesis epsilon underflows when split across terms"
-                                    .into(),
-                            ));
-                        }
-                        let groups = terms
-                            .iter()
-                            .map(|g| synthesize_single_rotation(g, term_epsilon))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map(|groups| groups.into_iter().flatten().collect::<Vec<_>>())?;
-                        if approximate {
-                            crate::synthesis::verify_controlled(gate, &groups, epsilon)
-                                .map_err(|e| SynthesisError(e.to_string()))?;
-                        }
-                        Ok((groups, approximate))
+                    if let Some(result) = synthesize_controlled_rotation(gate, epsilon)? {
+                        Ok(result)
                     } else {
                         synthesize_single_rotation(gate, epsilon).map(|gates| {
                             (
@@ -308,6 +281,125 @@ pub(crate) fn expand_controlled_rotation(gate: &Gate) -> Result<Option<Vec<Gate>
     Ok(Some(terms))
 }
 
+fn synthesize_controlled_rotation(
+    gate: &Gate,
+    epsilon: f64,
+) -> Result<Option<(Vec<Gate>, bool)>, SynthesisError> {
+    use crate::synthesis::{self, Scale};
+    let (angle, control, target) = match gate {
+        Gate::cp {
+            lambda,
+            control,
+            target,
+        } => (lambda, *control, *target),
+        Gate::crx {
+            theta,
+            control,
+            target,
+        }
+        | Gate::cry {
+            theta,
+            control,
+            target,
+        }
+        | Gate::crz {
+            theta,
+            control,
+            target,
+        } => (theta, *control, *target),
+        _ => return Ok(None),
+    };
+    // This is an explicitly requested approximation, verified against the
+    // entire original gate, not a tiny-angle deletion by an exact optimizer.
+    if synthesis::verify_controlled(gate, &[], epsilon).is_ok() {
+        let period = if matches!(gate, Gate::cp { .. }) {
+            2
+        } else {
+            4
+        };
+        let exact_identity = angle.components().is_some_and(|(p, r)| {
+            r.get().to_bits() == 0
+                && p.numerator() as i128 % (period * p.denominator() as i128) == 0
+        });
+        return Ok(Some((Vec::new(), !exact_identity)));
+    }
+    let exact_half = angle
+        .checked_half()
+        .ok()
+        .filter(|a| a.quarter_turns().is_some());
+    let approximate = exact_half.is_none();
+    let count = if matches!(gate, Gate::cp { .. }) {
+        3
+    } else {
+        2
+    };
+    let term_epsilon = if approximate {
+        (epsilon / (4 * count) as f64).next_down()
+    } else {
+        epsilon
+    };
+    if term_epsilon <= 0.0 {
+        return Err(SynthesisError(
+            "rotation synthesis epsilon underflows when split across terms".into(),
+        ));
+    }
+    let half = |q, scale| -> Result<Vec<Gate>, SynthesisError> {
+        if let Some(a) = &exact_half {
+            let a = if scale == Scale::NegativeHalf {
+                a.literal_neg().map_err(|e| SynthesisError(e.to_string()))?
+            } else {
+                a.clone()
+            };
+            Ok(a.rotation_gates(q))
+        } else {
+            word_gates(
+                synthesis::synthesize_scaled(angle, scale, term_epsilon)
+                    .map_err(|e| SynthesisError(e.to_string()))?,
+                q,
+            )
+        }
+    };
+    let mut gates = Vec::new();
+    if matches!(gate, Gate::cp { .. }) {
+        gates.extend(half(control, Scale::Half)?);
+    }
+    if matches!(gate, Gate::cry { .. }) {
+        gates.push(Gate::sdg(target));
+    }
+    if matches!(gate, Gate::crx { .. } | Gate::cry { .. }) {
+        gates.push(Gate::h(target));
+    }
+    let cx = Gate::cnot { control, target };
+    gates.extend(half(target, Scale::Half)?);
+    gates.push(cx.clone());
+    gates.extend(half(target, Scale::NegativeHalf)?);
+    gates.push(cx);
+    if matches!(gate, Gate::crx { .. } | Gate::cry { .. }) {
+        gates.push(Gate::h(target));
+    }
+    if matches!(gate, Gate::cry { .. }) {
+        gates.push(Gate::s(target));
+    }
+    synthesis::verify_controlled(gate, &gates, epsilon)
+        .map_err(|e| SynthesisError(e.to_string()))?;
+    Ok(Some((gates, approximate)))
+}
+
+fn word_gates(word: Vec<char>, q: crate::circuit::Qubit) -> Result<Vec<Gate>, SynthesisError> {
+    let mut gates = Vec::new();
+    for c in word {
+        match c {
+            'H' => gates.push(Gate::h(q)),
+            'T' => gates.push(Gate::t(q)),
+            'S' => gates.push(Gate::s(q)),
+            'X' => gates.push(Gate::x(q)),
+            'I' | 'W' => {}
+            _ => return Err(SynthesisError(format!("unknown gridsynth gate {c:?}"))),
+        }
+    }
+    Ok(gates)
+}
+
 fn synthesize_single_rotation(gate: &Gate, epsilon: f64) -> Result<Vec<Gate>, SynthesisError> {
     let (theta, q) = match gate {
         Gate::rz(a, q) | Gate::p(a, q) | Gate::rx(a, q) | Gate::ry(a, q) => (a, *q),
@@ -325,16 +417,7 @@ fn synthesize_single_rotation(gate: &Gate, epsilon: f64) -> Result<Vec<Gate>, Sy
     } else {
         let word = crate::synthesis::synthesize(theta, epsilon)
             .map_err(|e| SynthesisError(e.to_string()))?;
-        for c in word {
-            match c {
-                'H' => gates.push(Gate::h(q)),
-                'T' => gates.push(Gate::t(q)),
-                'S' => gates.push(Gate::s(q)),
-                'X' => gates.push(Gate::x(q)),
-                'I' | 'W' => {}
-                _ => return Err(SynthesisError(format!("unknown gridsynth gate {c:?}"))),
-            }
-        }
+        gates.extend(word_gates(word, q)?);
     }
     if matches!(gate, Gate::rx(..) | Gate::ry(..)) {
         gates.push(Gate::h(q));
@@ -1002,17 +1085,6 @@ mod tests {
                             gate.clone(),
                             Gate::t(control),
                         ]);
-                        if matches!(
-                            gate,
-                            Gate::cp { .. }
-                                | Gate::crx { .. }
-                                | Gate::cry { .. }
-                                | Gate::crz { .. }
-                        ) && theta.abs() == f64::from_bits(1)
-                        {
-                            assert!(DecomposeRotations { epsilon }.try_run(&input).is_err());
-                            continue;
-                        }
                         let output = DecomposeRotations { epsilon }.try_run(&input).unwrap();
                         assert!(
                             output
@@ -1034,7 +1106,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 240);
+        assert_eq!(checked, 256);
     }
 
     #[test]

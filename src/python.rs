@@ -187,10 +187,18 @@ fn _optimize_qasm(
     Ok((output, raw_report(report)))
 }
 
+/// Convert native output without collapsing mixed angles into SDK floats.
+#[pyfunction]
+fn _sdk_qasm(qasm: &str) -> PyResult<String> {
+    let circuit = Circuit::from_qasm(qasm).map_err(QasmError::new_err)?;
+    crate::qasm::serialize_sdk(&circuit).map_err(OptimizationError::new_err)
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_optimize_qasm, module)?)?;
+    module.add_function(wrap_pyfunction!(_sdk_qasm, module)?)?;
     let tzap_error = module.py().get_type::<TzapError>();
     let qasm_error = module.py().get_type::<QasmError>();
     let optimization_error = module.py().get_type::<OptimizationError>();

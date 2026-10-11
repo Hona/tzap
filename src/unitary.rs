@@ -246,27 +246,40 @@ fn gate_matrix_sx() -> [[C; 2]; 2] {
     [[diagonal, off_diagonal], [off_diagonal, diagonal]]
 }
 
-fn gate_matrix_p(theta: f64) -> [[C; 2]; 2] {
-    [[C::ONE, C::ZERO], [C::ZERO, C::polar(1.0, theta)]]
+// A floating reference, not a certificate: multiply the symbolic and numeric
+// phases separately. Converting their sum to one float can erase a quarter turn
+// and make the oracle agree with the same bug in an SDK adapter.
+fn angle_phase(angle: &crate::angle::Angle, half: bool) -> C {
+    let (pi, residual) = angle
+        .components()
+        .expect("test oracle requires accepted angle components");
+    let period = if half { 4 } else { 2 };
+    let numerator = pi.numerator() as i128 % (period * pi.denominator() as i128);
+    let divisor = if half { 2.0 } else { 1.0 };
+    let symbolic = C::polar(
+        1.0,
+        (numerator as f64 / pi.denominator() as f64) * PI / divisor,
+    );
+    symbolic * C::polar(1.0, residual.get() / divisor)
 }
-
-fn gate_matrix_rx(theta: f64) -> [[C; 2]; 2] {
-    let diagonal = C::new((theta / 2.0).cos(), 0.0);
-    let off_diagonal = C::new(0.0, -(theta / 2.0).sin());
+fn gate_matrix_p(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    [[C::ONE, C::ZERO], [C::ZERO, angle_phase(theta, false)]]
+}
+fn gate_matrix_rx(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    let phase = angle_phase(theta, true);
+    let diagonal = C::new(phase.re, 0.0);
+    let off_diagonal = C::new(0.0, -phase.im);
     [[diagonal, off_diagonal], [off_diagonal, diagonal]]
 }
-
-fn gate_matrix_ry(theta: f64) -> [[C; 2]; 2] {
-    let c = C::new((theta / 2.0).cos(), 0.0);
-    let s = C::new((theta / 2.0).sin(), 0.0);
+fn gate_matrix_ry(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    let phase = angle_phase(theta, true);
+    let c = C::new(phase.re, 0.0);
+    let s = C::new(phase.im, 0.0);
     [[c, s * -1.0], [s, c]]
 }
-
-fn gate_matrix_rz(theta: f64) -> [[C; 2]; 2] {
-    [
-        [C::polar(1.0, -theta / 2.0), C::ZERO],
-        [C::ZERO, C::polar(1.0, theta / 2.0)],
-    ]
+fn gate_matrix_rz(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    let phase = angle_phase(theta, true);
+    [[phase.conj(), C::ZERO], [C::ZERO, phase]]
 }
 
 pub(crate) fn circuit_unitary(circuit: &Circuit) -> Vec<Vec<C>> {
@@ -281,44 +294,12 @@ pub(crate) fn circuit_unitary(circuit: &Circuit) -> Vec<Vec<C>> {
             Gate::z(q) => mat.apply_single(gate_matrix_z(), *q as usize, n),
             Gate::t(q) => mat.apply_single(gate_matrix_t(), *q as usize, n),
             Gate::tdg(q) => mat.apply_single(gate_matrix_tdg(), *q as usize, n),
-            Gate::rz(theta, q) => mat.apply_single(
-                gate_matrix_rz(
-                    theta
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *q as usize,
-                n,
-            ),
-            Gate::p(theta, q) => mat.apply_single(
-                gate_matrix_p(
-                    theta
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *q as usize,
-                n,
-            ),
+            Gate::rz(theta, q) => mat.apply_single(gate_matrix_rz(theta), *q as usize, n),
+            Gate::p(theta, q) => mat.apply_single(gate_matrix_p(theta), *q as usize, n),
             Gate::y(q) => mat.apply_single(gate_matrix_y(), *q as usize, n),
             Gate::sx(q) => mat.apply_single(gate_matrix_sx(), *q as usize, n),
-            Gate::rx(theta, q) => mat.apply_single(
-                gate_matrix_rx(
-                    theta
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *q as usize,
-                n,
-            ),
-            Gate::ry(theta, q) => mat.apply_single(
-                gate_matrix_ry(
-                    theta
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *q as usize,
-                n,
-            ),
+            Gate::rx(theta, q) => mat.apply_single(gate_matrix_rx(theta), *q as usize, n),
+            Gate::ry(theta, q) => mat.apply_single(gate_matrix_ry(theta), *q as usize, n),
             Gate::cy { control, target } => {
                 mat.apply_controlled_single(gate_matrix_y(), *control, *target, n)
             }
@@ -329,58 +310,22 @@ pub(crate) fn circuit_unitary(circuit: &Circuit) -> Vec<Vec<C>> {
                 lambda,
                 control,
                 target,
-            } => mat.apply_controlled_single(
-                gate_matrix_p(
-                    lambda
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *control,
-                *target,
-                n,
-            ),
+            } => mat.apply_controlled_single(gate_matrix_p(lambda), *control, *target, n),
             Gate::crx {
                 theta,
                 control,
                 target,
-            } => mat.apply_controlled_single(
-                gate_matrix_rx(
-                    theta
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *control,
-                *target,
-                n,
-            ),
+            } => mat.apply_controlled_single(gate_matrix_rx(theta), *control, *target, n),
             Gate::cry {
                 theta,
                 control,
                 target,
-            } => mat.apply_controlled_single(
-                gate_matrix_ry(
-                    theta
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *control,
-                *target,
-                n,
-            ),
+            } => mat.apply_controlled_single(gate_matrix_ry(theta), *control, *target, n),
             Gate::crz {
                 theta,
                 control,
                 target,
-            } => mat.apply_controlled_single(
-                gate_matrix_rz(
-                    theta
-                        .to_f64_lossy()
-                        .expect("test oracle requires evaluable angle"),
-                ),
-                *control,
-                *target,
-                n,
-            ),
+            } => mat.apply_controlled_single(gate_matrix_rz(theta), *control, *target, n),
             Gate::cswap {
                 control,
                 first,
@@ -1297,3 +1242,36 @@ mod tests {
 
 #[cfg(test)]
 mod native_tests;
+
+#[test]
+fn floating_reference_detects_lost_symbolic_quarter_turns() {
+    use crate::angle::Angle;
+    for magnitude in [1e17, -1e17, f64::MAX] {
+        let numeric = Angle::from_f64(magnitude).unwrap();
+        let mixed = Angle::pi_fraction(1, 4)
+            .unwrap()
+            .checked_add_signed(1, &numeric)
+            .unwrap();
+        let before = Circuit {
+            num_qubits: 1,
+            num_cbits: 0,
+            gates: vec![Gate::p(mixed, 0)],
+        };
+        let wrong = Circuit {
+            num_qubits: 1,
+            num_cbits: 0,
+            gates: vec![Gate::p(numeric, 0)],
+        };
+        assert!(!circuits_equiv(&before, &wrong, 1e-12));
+    }
+    let branch_phase = Circuit {
+        num_qubits: 2,
+        num_cbits: 0,
+        gates: vec![Gate::crz {
+            theta: Angle::pi_fraction(2, 1).unwrap(),
+            control: 0,
+            target: 1,
+        }],
+    };
+    assert!(!circuits_equiv(&branch_phase, &Circuit::new(2), 1e-12));
+}

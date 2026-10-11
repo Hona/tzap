@@ -223,16 +223,17 @@ fn controlled_phases_use_literal_angles_before_decomposition() {
         control: 0,
         target: 1,
     });
-    let error = DecomposeRotations { epsilon: 1e-20 }
+    let output = DecomposeRotations { epsilon: 1e-20 }
         .try_run(&tiny)
-        .unwrap_err();
-    assert!(error.0.contains("gate 0") && error.0.contains("round"));
-    assert_eq!(
-        DecomposeRotations { epsilon: 1e-20 }.run(&tiny).gates,
-        tiny.gates
+        .unwrap();
+    assert!(
+        output.gates.is_empty(),
+        "tiny gate is removed only by a certified approximate pass"
     );
-    // A later failure must also discard an earlier successful synthesis.
-    tiny.gates.insert(0, Gate::rz_f64(0.3, 0).unwrap());
+    check_every_exact_pipeline(&tiny);
+    // A later unsupported expression must discard an earlier successful synthesis.
+    let unsupported = qasm::parse("qreg q[2]; crz(pi/9223372036854775808) q[0],q[1];").unwrap();
+    tiny.gates = vec![Gate::rz_f64(0.3, 0).unwrap(), unsupported.gates[0].clone()];
     let pass = DecomposeRotations { epsilon: 1e-20 };
     assert!(pass.try_run(&tiny).unwrap_err().0.contains("gate 1"));
     assert_eq!(pass.run(&tiny).gates, tiny.gates);
@@ -376,4 +377,99 @@ fn synthesis_bounds_accumulate_outward_and_remain_per_run() {
     )
     .unwrap();
     assert_eq!(overflow.numerical.certified_error_bound, None);
+}
+
+#[test]
+fn sdk_export_preserves_exact_rational_phases_in_all_diagonalized_axes() {
+    for value in [1e17, -1e17, f64::MAX, f64::from_bits(1)] {
+        for axis in ["p", "rz", "rx", "ry"] {
+            let mut input = Circuit::new(1);
+            input.apply(Gate::t(0));
+            if matches!(axis, "rx" | "ry") {
+                input.apply(Gate::h(0));
+            }
+            if axis == "ry" {
+                input.apply(Gate::s(0));
+            }
+            let angle = Angle::from_f64(value).unwrap();
+            input.apply(match axis {
+                "p" => Gate::p(angle, 0),
+                "rx" => Gate::rx(angle, 0),
+                "ry" => Gate::ry(angle, 0),
+                _ => Gate::rz(angle, 0),
+            });
+            if axis == "ry" {
+                input.apply(Gate::sdg(0));
+            }
+            if matches!(axis, "rx" | "ry") {
+                input.apply(Gate::h(0));
+            }
+            let expected = semantics(&input);
+            for level in [Level::O1, Level::O2, Level::O3] {
+                for parallel in [false, true] {
+                    let (optimized, _) = optimize(
+                        &input,
+                        &Options {
+                            level,
+                            parallel,
+                            ..Options::default()
+                        },
+                    )
+                    .unwrap();
+                    let exported = qasm::parse(&qasm::serialize_sdk(&optimized).unwrap()).unwrap();
+                    assert!(
+                        equivalent(&expected, &exported),
+                        "{axis}, {value}, {level:?}, parallel={parallel}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn certified_tiny_controlled_identity_is_counted_and_is_never_an_exact_fold() {
+    for name in ["cp", "crx", "cry", "crz"] {
+        for source in ["5e-324", "-5e-324", "1.5e-323", "-1.5e-323"] {
+            let input = qasm::parse(&format!("qreg q[2]; {name}({source}) q[1],q[0];")).unwrap();
+            for level in [Level::O1, Level::O2, Level::O3] {
+                let (output, report) = optimize(
+                    &input,
+                    &Options {
+                        level,
+                        ..Options::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(output.gates, input.gates);
+                assert_eq!(report.numerical.certified_syntheses, 0);
+            }
+            let (output, report) = optimize(
+                &input,
+                &Options {
+                    passes: Some(vec![PassName::DecomposeRotations]),
+                    rz_epsilon: 1e-20,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            assert!(output.gates.is_empty());
+            assert_eq!(report.numerical.certified_syntheses, 1);
+            assert!(report.numerical.certified_error_bound.unwrap() >= 1e-20);
+        }
+    }
+    // A named angle approximated by identity still consumes a synthesis bound.
+    let input = qasm::parse("qreg q[2]; crz(2*pi) q[0],q[1];").unwrap();
+    let (output, report) = optimize(
+        &input,
+        &Options {
+            passes: Some(vec![PassName::DecomposeRotations]),
+            rz_epsilon: 3.0,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(output.gates.is_empty());
+    assert_eq!(report.numerical.certified_syntheses, 1);
+    assert_eq!(report.numerical.uncertified_syntheses, 0);
 }

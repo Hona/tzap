@@ -105,10 +105,21 @@ are preserved unchanged, excluded from folding, and warned about by the CLI
 and Python wrapper. Powers, calculator functions, and gate definitions remain
 outside the supported subset. Expressions may span lines.
 
-QASM output retains symbolic fractions. Mixed values serialize as adjacent
-pi and numeric Rz operations. `qasm::serialize_numeric_lossy` is an explicit
-approximate export; its result counts uncertified fraction conversions and it
-rejects preserved expressions.
+QASM output retains symbolic fractions. Mixed Rz values serialize as adjacent
+pi and numeric rotations. `qasm::serialize_sdk` exports finite numeric parameters
+without rounding symbolic quarter turns into floats: it emits named gates and
+numeric residuals separately, using axis changes for Rx/Ry. Controlled gates
+expand before projective normalization to retain their relative branch phases.
+Unsupported symbolic angles and preserved expressions return an error; callers
+can request certified rotation synthesis explicitly. Qiskit and PennyLane share
+this native export path and consider equivalence up to overall global phase.
+SDK output may need more gates than the native optimized circuit to preserve a
+mixed angle exactly.
+
+`qasm::serialize_numeric_lossy` supports all eight angle-bearing gate kinds. It
+prefers exact named-gate expansions, counts each input gate that instead requires
+an uncertified fraction-to-float conversion, and rejects preserved expressions.
+Register sizes and classical measurement operands are retained by both exports.
 
 ## Optimizing
 
@@ -178,17 +189,23 @@ gates remain outside SuperOpt's exact matrix domain.
 
 Controlled rotations expand into unconditional half-angle rotations and two
 CNOTs before synthesis. CP also needs P(lambda/2) on the control. Half-angles use
-checked literal arithmetic; unrepresentable halves produce an error. Numerical
-terms share a conservative fraction of the input gate's budget, and the complete
+temporary exact rational scaling of the original accepted angle; halves need
+not fit in the public Angle representation. Before expansion, an identity
+candidate can be certified against the complete original controlled operator.
+This approximation is exclusive to explicitly requested rotation decomposition;
+exact optimizers and SDK transport preserve tiny rotations. Numerical terms
+share a conservative fraction of the input gate's budget, and the complete
 two-qubit operator is independently verified, including the inactive-control
 subspace. Large angles use enclosing mathematical-pi reduction, without native
 binary64 trigonometry or floating remainders.
 
 The initial implementation limits interval precision to 2,048 bits, candidate
 words to 8,192 instructions, and candidate attempts to three. Approximate terms
-require epsilon at least `1e-80`; a controlled gate's tighter term budgets can
-reach that limit earlier. Exact lowering does not need a numeric budget. Requests
-outside the supported limits return an error instead of unverified output.
+sent to the synthesis backend require epsilon at least `1e-80`; a controlled
+gate's tighter term budgets can reach that limit earlier. Exact lowering does not
+need a numeric budget. A directly certified controlled identity does not use the
+backend and can succeed at smaller epsilon within the interval precision limit.
+Requests outside the supported limits return an error instead of unverified output.
 `Report::numerical.certified_error_bound` is an outward-rounded sum of bounds
 for synthesized input gates (`None` if the sum overflows). It covers synthesis
 only; it does not certify parser mathematical source semantics or unchecked

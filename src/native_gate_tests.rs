@@ -68,7 +68,7 @@ fn every_parameterized_gate_preserves_pi_fractions_and_opaque_expressions() {
 }
 
 #[test]
-fn controlled_synthesis_refuses_unrepresentable_half_angles() {
+fn controlled_synthesis_certifies_unrepresentable_half_angles() {
     let angle = Angle::from_f64(f64::from_bits(1)).unwrap();
     let mut input = Circuit::new(2);
     input.apply(Gate::crx {
@@ -76,7 +76,13 @@ fn controlled_synthesis_refuses_unrepresentable_half_angles() {
         control: 0,
         target: 1,
     });
-    assert!(DecomposeRotations::default().try_run(&input).is_err());
+    assert!(
+        DecomposeRotations::default()
+            .try_run(&input)
+            .unwrap()
+            .gates
+            .is_empty()
+    );
     // Export uses a CRZ basis change and never halves or drops the subnormal.
     let parsed = Circuit::from_qasm(&input.to_qasm()).unwrap();
     assert_eq!(

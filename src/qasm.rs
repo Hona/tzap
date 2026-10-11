@@ -2259,33 +2259,19 @@ measure q[1] -> c[1];
 
 /// Explicit numeric export for consumers without symbolic pi parameters.
 /// Fraction conversion is approximate and its error is not certified.
+#[derive(Debug)]
 pub struct NumericExport {
     pub qasm: String,
     pub uncertified_conversions: usize,
 }
 
 pub fn serialize_numeric_lossy(circuit: &Circuit) -> Result<NumericExport, String> {
-    let mut output = Circuit::with_cbits(circuit.num_qubits, circuit.num_cbits);
-    let mut conversions = 0;
-    for (index, gate) in circuit.gates.iter().enumerate() {
-        match gate {
-            Gate::rz(angle, q) => {
-                if angle.quarter_turns().is_some() {
-                    angle.emit(&mut output, *q);
-                } else {
-                    let (pi, _) = angle.components().ok_or_else(|| format!("gate {index}: preserved angle expression cannot be exported numerically"))?;
-                    let numeric = angle
-                        .to_f64_lossy()
-                        .map_err(|e| format!("gate {index}: {e}"))?;
-                    conversions += usize::from(pi.numerator() != 0);
-                    output.apply(Gate::rz_f64(numeric, *q).map_err(|e| e.to_string())?);
-                }
-            }
-            _ => output.apply(gate.clone()),
-        }
-    }
-    Ok(NumericExport {
-        qasm: serialize(&output),
-        uncertified_conversions: conversions,
-    })
+    crate::angle_export::lossy(circuit)
+}
+
+/// Numeric-parameter QASM for SDKs, equivalent up to overall global phase.
+/// Named gates preserve mathematical quarter turns separately from floats.
+/// Unsupported symbolic angles fail; this function never approximates them.
+pub fn serialize_sdk(circuit: &Circuit) -> Result<String, String> {
+    crate::angle_export::sdk(circuit)
 }
