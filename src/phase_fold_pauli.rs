@@ -41,8 +41,9 @@ use std::hash::{BuildHasher, Hasher};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::angle::AngleContext;
 use crate::circuit::{Circuit, Gate, qubit_operands};
-use crate::pass::Pass;
+use crate::pass::{Pass, PassState};
 use crate::pbc::{packed_anticommutes, support_signature};
 
 /// Maximum retained exact axis storage, in 64-bit words (256 MiB). Reaching
@@ -76,11 +77,17 @@ impl Pass for PhaseFoldPauli {
     fn run(&self, circuit: &Circuit) -> Circuit {
         phase_fold_pauli(circuit)
     }
+    fn run_with_state(&self, circuit: &Circuit, state: &mut PassState) -> Circuit {
+        phase_fold_pauli_with_context(circuit, &mut state.angles)
+    }
 }
 
 /// Fold rotations using checked angle arithmetic and exact Pauli commutation.
 /// Random fingerprints only select candidates; exact checks authorize rewrites.
 pub fn phase_fold_pauli(circuit: &Circuit) -> Circuit {
+    phase_fold_pauli_with_context(circuit, &mut PassState::default().angles)
+}
+fn phase_fold_pauli_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Circuit {
     let lowered = crate::angle::lowered_if_needed(circuit);
     let circuit = &lowered;
     let n = circuit.num_qubits;
@@ -91,7 +98,7 @@ pub fn phase_fold_pauli(circuit: &Circuit) -> Circuit {
         .map(|_| (random_label(), random_label()))
         .collect();
     let sliced = circuit.num_qubits <= MAX_SLICED_QUBITS;
-    fold(circuit, &labels, MAX_ATTEMPT_STEPS, sliced)
+    fold_with_context(circuit, &labels, MAX_ATTEMPT_STEPS, sliced, ctx)
 }
 
 fn frame_fits(n: usize) -> bool {
@@ -110,7 +117,23 @@ fn random_label() -> u128 {
 /// per-attempt budget, and bit-sliced (`sliced`) or scalar support lists. The
 /// two kinds of list reach the same verdicts; only the budget accounting
 /// differs.
+#[cfg(test)]
 fn fold(circuit: &Circuit, labels: &[(u128, u128)], attempt_steps: usize, sliced: bool) -> Circuit {
+    fold_with_context(
+        circuit,
+        labels,
+        attempt_steps,
+        sliced,
+        &mut AngleContext::default(),
+    )
+}
+fn fold_with_context(
+    circuit: &Circuit,
+    labels: &[(u128, u128)],
+    attempt_steps: usize,
+    sliced: bool,
+    ctx: &mut AngleContext,
+) -> Circuit {
     let n = circuit.num_qubits;
     let l = n.div_ceil(64).max(1);
     // The exact frame has 2n rows of 2l words. Bound it before allocating it,
@@ -118,7 +141,15 @@ fn fold(circuit: &Circuit, labels: &[(u128, u128)], attempt_steps: usize, sliced
     if labels.len() != n || !frame_fits(n) || !well_formed(circuit) || !may_fold(circuit, labels) {
         return circuit.clone();
     }
-    let mut folder = Folder::new(labels, n, l, attempt_steps, sliced, circuit.gates.len());
+    let mut folder = Folder::new(
+        labels,
+        n,
+        l,
+        attempt_steps,
+        sliced,
+        circuit.gates.len(),
+        ctx,
+    );
     for (idx, gate) in circuit.gates.iter().enumerate() {
         if folder.step(idx, gate).is_none() {
             break; // axis storage is full
@@ -197,7 +228,8 @@ fn may_fold(circuit: &Circuit, labels: &[(u128, u128)]) -> bool {
 }
 
 /// The state of the main scan.
-struct Folder {
+struct Folder<'a> {
+    angles: &'a mut AngleContext,
     /// Fingerprints of the frame rows.
     sketch: SketchFrame,
     /// The frame rows themselves.
@@ -219,7 +251,7 @@ struct Replacement {
     kind: RotationKind,
 }
 
-impl Folder {
+impl<'a> Folder<'a> {
     fn new(
         labels: &[(u128, u128)],
         n: usize,
@@ -227,8 +259,10 @@ impl Folder {
         attempt_steps: usize,
         sliced: bool,
         num_gates: usize,
+        angles: &'a mut AngleContext,
     ) -> Self {
         Self {
+            angles,
             sketch: SketchFrame::new(labels),
             exact: ExactFrame::new(n, l),
             history: History::new(n, l, attempt_steps, sliced),
@@ -312,9 +346,12 @@ impl Folder {
             // interval gives an angle s_i θ_i + s_j θ_j on W. At j, the
             // physical Z rotation needs that angle multiplied by s_j.
             let prior = self.history.rotation(id);
-            if let Some(merged) =
-                Angle::merge(prior.angle.clone(), prior.sign * sign, angle.clone())
-                && merged.0.emitted_gate_count() <= prior.input_gates + 1
+            if let Some(merged) = Angle::merge(
+                self.angles,
+                prior.angle.clone(),
+                prior.sign * sign,
+                angle.clone(),
+            ) && merged.0.emitted_gate_count() <= prior.input_gates + 1
             {
                 input_gates = prior.input_gates + 1;
                 self.history.kill(id);
@@ -399,7 +436,7 @@ impl Folder {
     /// as `PhaseFoldRand` does, whether or not it folded.
     fn rewrite(self, circuit: &Circuit) -> Circuit {
         let exact_rz =
-            |g: &Gate| matches!(g, Gate::rz(theta, _) if theta.quarter_turns().is_some());
+            |g: &Gate| matches!(g, Gate::rz(theta, _) if theta.projective_quarters().is_some());
         if self.replacements.is_empty() && !circuit.gates.iter().any(exact_rz) {
             return circuit.clone();
         }
@@ -1103,14 +1140,18 @@ impl Angle {
     fn of(gate: &Gate) -> Self {
         Self(crate::angle::Angle::of_gate(gate).expect("rotation gate"))
     }
-    fn merge(prior: Self, sign: i8, current: Self) -> Option<Self> {
-        prior.0.checked_add_signed(sign, &current.0).ok().map(Self)
+    fn merge(ctx: &mut AngleContext, prior: Self, sign: i8, current: Self) -> Option<Self> {
+        prior
+            .0
+            .merge_phases_with(ctx, sign, &current.0)
+            .ok()
+            .map(Self)
     }
     fn is_clifford(&self) -> bool {
-        self.0.quarter_turns().is_some_and(|k| k & 1 == 0)
+        self.0.projective_quarters().is_some_and(|k| k & 1 == 0)
     }
     fn clifford_gate(&self, q: u32) -> Option<Gate> {
-        match self.0.quarter_turns() {
+        match self.0.projective_quarters() {
             Some(2) => Some(Gate::s(q)),
             Some(4) => Some(Gate::z(q)),
             Some(6) => Some(Gate::sdg(q)),
@@ -1120,8 +1161,8 @@ impl Angle {
     fn emit(&self, output: &mut Circuit, q: u32, kind: RotationKind) {
         if kind == RotationKind::Z {
             self.0.emit(output, q);
-        } else if !self.0.is_zero() {
-            output.apply(kind.gate(self.0.normalized(), q));
+        } else if !self.0.projective_identity() {
+            output.apply(kind.gate(self.0.clone(), q));
         }
     }
 }

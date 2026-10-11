@@ -62,7 +62,7 @@ pub(crate) fn failure(error: AngleError) {
             let target = match error {
                 AngleError::RoundedAddition => &c.rounded,
                 AngleError::NonFinite => &c.nonfinite,
-                AngleError::RepresentationLimit => &c.coefficient,
+                AngleError::RepresentationLimit | AngleError::Limit(_) => &c.coefficient,
                 _ => return,
             };
             target.fetch_add(1, Ordering::Relaxed);
@@ -87,22 +87,15 @@ pub(crate) fn certification_failure() {
     }
 }
 impl NumericalReport {
-    pub fn input(circuit: &Circuit, options: &Options) -> Self {
-        let mut result = Self {
+    pub fn input(_circuit: &Circuit, options: &Options) -> Self {
+        Self {
             certified_error_bound: Some(0.0),
             randomized_matching: options
                 .passes
                 .as_ref()
                 .is_none_or(|passes| passes.contains(&PassName::PhaseFoldRand)),
             ..Self::default()
-        };
-        for gate in &circuit.gates {
-            if let Some(a) = gate.angle() {
-                result.preserved_expressions += usize::from(a.is_preserved());
-                result.numerical_fallbacks += usize::from(a.used_numeric_fallback());
-            }
         }
-        result
     }
     pub(crate) fn collected(circuit: &Circuit, options: &Options, c: &Counters) -> Self {
         Self {

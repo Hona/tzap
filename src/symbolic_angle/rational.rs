@@ -331,7 +331,7 @@ impl Rational {
             Ok(None)
         }
     }
-    pub(super) fn from_bits(bits: u64) -> Self {
+    pub(crate) fn from_bits(bits: u64) -> Self {
         let exponent = ((bits >> 52) & 2047) as i32;
         let mut n = bits & ((1 << 52) - 1);
         if exponent != 0 {

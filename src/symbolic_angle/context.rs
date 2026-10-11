@@ -16,6 +16,7 @@ pub struct InternerStats {
 /// context. Every public operation has a fresh, bounded work budget.
 pub struct AngleContext {
     limits: Limits,
+    remaining_run_work: Option<usize>,
     pub(super) nodes: FxHashMap<u64, Vec<Weak<Node>>>,
     pub(super) stats: InternerStats,
 }
@@ -28,9 +29,36 @@ impl AngleContext {
     pub fn with_limits(limits: Limits) -> Self {
         Self {
             limits,
+            remaining_run_work: None,
             nodes: FxHashMap::default(),
             stats: InternerStats::default(),
         }
+    }
+    pub(crate) fn with_run_budget(mut self) -> Self {
+        self.remaining_run_work = Some(self.limits.max_work);
+        self
+    }
+    /// Merge phase rotations in an explicit projective circuit scope.
+    /// The scalar add/sub APIs retain literal coefficients and periods.
+    #[inline]
+    pub(crate) fn merge_phases(&mut self, a: &Angle, sign: i8, b: &Angle) -> Result<Angle, Error> {
+        let mut budget = self.inputs(&[a, b])?;
+        if let (Some(a), Some(b)) = (
+            a.quarter_turns(RotationPeriod::TwoPi),
+            b.quarter_turns(RotationPeriod::TwoPi),
+        ) {
+            let out =
+                Angle::phase_quarters((sign as i16 * a as i16 + b as i16).rem_euclid(8) as u8);
+            budget.value(&out)?;
+            return Ok(out);
+        }
+        let a = if sign < 0 {
+            self.scale_inner(a, &Rational::integer(-1), &mut budget)?
+        } else {
+            a.clone()
+        };
+        let value = self.add_inner(&a, b, &mut budget)?;
+        self.rotation_view(&value, RotationPeriod::TwoPi)
     }
     pub fn limits(&self) -> Limits {
         self.limits
@@ -171,8 +199,25 @@ impl AngleContext {
         };
         self.number(r, true, &mut budget)
     }
+    pub(super) fn charge_run(&mut self, values: &[&Angle]) -> Result<(), Error> {
+        if let Some(remaining) = &mut self.remaining_run_work {
+            let mut cost = 0usize;
+            for value in values {
+                let m = value.metadata();
+                if m.nodes > 1 || m.bits > 128 {
+                    cost = cost
+                        .saturating_add(m.nodes.saturating_mul(m.bits.div_ceil(64).max(1).pow(2)));
+                }
+            }
+            *remaining = remaining
+                .checked_sub(cost)
+                .ok_or(Error::Limit(Resource::Work))?;
+        }
+        Ok(())
+    }
     #[inline]
-    fn inputs(&self, values: &[&Angle]) -> Result<Budget, Error> {
+    fn inputs(&mut self, values: &[&Angle]) -> Result<Budget, Error> {
+        self.charge_run(values)?;
         let mut budget = Budget::new(self.limits);
         for value in values {
             budget.value(value)?;
@@ -204,6 +249,9 @@ impl AngleContext {
             } else {
                 Value::Rational { n, d }
             }));
+        }
+        if !pi && let Some(value) = dyadic::from_rational(&r) {
+            return Ok(value);
         }
         let sign = Sign::from_integer(r.signum());
         self.intern(

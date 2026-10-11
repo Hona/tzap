@@ -131,3 +131,84 @@ tests continue to independently verify proposed words against accepted targets.
 Clippy's all-target check requires exempting two pre-existing approximate
 constant diagnostics in `tests/numerical_fuzz.rs`; no symbolic adapter warnings
 remain.
+
+## Integrated circuits and passes: 2026-10-11
+
+The integrated candidate stores symbolic angles in every circuit gate and uses
+exact arithmetic throughout the passes. Main is pinned to `f29e728` (`origin/main`
+at the start of integration); the candidate is `codex/symbolic-angle`, following
+`e02a6a6`. This compares the implementation above with the complete migration.
+
+The paper manifest in `~/git/tzap-superopt/evaluation/rq3/rq2-benchmarks.txt`
+contains 135 circuits and 110,600,280 input gates. Its SHA-256 is
+`4e301ecf3d6b22eb62d00467177ef3ce84ba44082af24961655be7a24df0c363`. All files came from the local corpus,
+including locally added suites. Three repetitions of each version alternate
+binary order, giving 810 successful runs, with no concurrent builds or tests.
+The machine, compiler and dependency versions match the preceding baseline.
+
+The release harness runs serial O3 with the Base MURM basis, three-qubit windows,
+25 window gates and 200,000 MURM entries. Toffoli gates are decomposed before
+optimization, matching paper input preparation. Both versions share the same
+cache directory and harness source. Timings exclude observed MURM loading/building
+and output serialization/hashing. Pipeline time includes reading, parsing and
+input Toffoli decomposition. Totals sum per-circuit medians.
+
+| Scope | Main seconds | Symbolic seconds | Change |
+| --- | ---: | ---: | ---: |
+| Optimization, all 135 circuits | 90.465 | 90.672 | +0.23% |
+| Read/parse/decompose/optimize pipeline | 99.975 | 100.295 | +0.32% |
+| Optimization, 76 circuits with no input Rz | 18.393 | 18.618 | +1.22% |
+
+The three complete repetition sums change by +0.94%, +0.85% and -1.14%.
+The aggregate difference is small relative to run variation; these local numbers
+are not a universal slowdown bound. Angle and Gate remain 16 and 32 bytes on
+this ARM64 target, and inline scalar/quarter-turn allocation checks pass.
+
+| Suite | Cases | Main optimization seconds | Symbolic seconds | Change |
+| --- | ---: | ---: | ---: | ---: |
+| cobble-rz | 31 | 71.947 | 71.928 | -0.03% |
+| feynman | 18 | 4.516 | 4.604 | +1.95% |
+| large-circuits | 72 | 7.370 | 7.398 | +0.38% |
+| qft | 4 | 6.595 | 6.705 | +1.67% |
+| quasar-large | 10 | 0.038 | 0.038 | -0.93% |
+
+All 76 circuits with no input Rz have identical output text and metrics.
+Across all circuits, 98 match output metrics and 84 match serialized output.
+Native decimal inputs now mean exact decimal rationals, and formerly refused
+rounded/overflowing folds can succeed, so numerical circuits need not have the
+same output as main. Total output gates fall from 9,939,079 to 9,936,046, and Rz
+counts fall from 35,524 to 32,554. Total T counts change from 3,720,954 to
+3,720,958; two-qubit counts change from 3,769,454 to 3,769,385. These are measured
+quality differences, not a claim that every metric improves on every circuit.
+All output hashes, metrics, rounds and numerical reports are deterministic
+within each version across the three repetitions.
+
+Per-circuit costs vary. `spectral-thresholding-n13` takes five O3 rounds on main
+and seven after exact folding, and is 14.92% slower in the full run. Seven fresh
+alternating samples confirm an 8.46% slowdown (326.18 vs 353.79 ms). Two other
+apparent outliers mostly disappear in the seven-sample check: `urf1_278` changes
+by +0.93%, and `qft_q020_d32421` by -0.10%. The largest case, `ols-ridge-d20`, is
+3.36% slower in the full run, and had been 0.83% slower in the quiet pilot.
+The complete dataset retains these differences rather than hiding outliers.
+
+A separate one-process-per-version peak-memory measurement of `ols-ridge-d20`
+uses macOS `/usr/bin/time -l`: main peaks at 3,507.0 MiB and symbolic at
+3,038.7 MiB. This is one sample and includes process/library/allocator memory;
+it does not establish a general memory improvement.
+
+The new coverage includes independent formal phase signatures for general
+functions across cancellation, both phase folders and CnotMin, 64 seeded
+expression streams, forced resource failures and rollback, exact gate periods,
+independent rational series enclosures for all six functions, certified complete
+controlled operators, exact multi-parameter SDK export and 692 Python tests.
+Release stress checks use `NUMERICAL_FUZZ_CASES=128` and `PBC_FUZZ_CASES=4` and
+include the 5,120-case native configuration matrix and QCEC equivalence checks.
+
+The local reproduction bundle is `/tmp/tzap-symbolic-angle/integrated-superopt-run`:
+`run.py full`, `analyze.py`, `full.jsonl`, `summary.json`, per-version stderr,
+`outliers.jsonl` and memory records. The unchanged server source and Cargo
+manifests are in `/tmp/tzap-symbolic-angle/superopt-run/{main,candidate}`.
+Build the candidate with its release manifest, copy `angle-benchmark` to the
+reproduction bundle's `candidate-benchmark`, then run `python3 run.py full`
+without competing builds/tests. `summary.json` records binary checksums and the
+method; the main source snapshot is `/tmp/tzap-symbolic-angle/stage1-main`.

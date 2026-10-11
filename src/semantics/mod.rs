@@ -261,8 +261,8 @@ fn gate_matrix(n: usize, gate: &Gate, index: usize) -> Result<Matrix, Error> {
             target,
             matches!(gate, Gate::ccx { .. }),
         ),
-        Gate::rz(ref angle, q) if angle.quarter_turns().is_some() => {
-            let k = angle.quarter_turns().unwrap();
+        Gate::rz(ref angle, q) if angle.projective_quarters().is_some() => {
+            let k = angle.projective_quarters().unwrap();
             single(n, q, [[one, zero.clone()], [zero, Scalar::omega(k)]])
         }
         Gate::rz(..)

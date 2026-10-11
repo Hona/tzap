@@ -94,7 +94,7 @@ fn assert_schema(report: &Json, context: &str) {
     report.at("seconds").as_f64();
 
     let numerical = report.get("numerical");
-    assert_eq!(numerical.at("input_policy").as_str(), "accepted_angles");
+    assert_eq!(numerical.at("input_policy").as_str(), "exact_symbolic");
     assert_eq!(numerical.at("folding").as_str(), "no_added_rounding");
     for field in [
         "preserved_expressions",
@@ -765,18 +765,15 @@ fn the_report_names_the_cache_directory() {
 }
 
 #[test]
-fn preserved_expression_warns_and_reports_its_input_policy() {
+fn exact_large_expression_reports_its_input_policy() {
     let source = "OPENQASM 2.0; qreg q[1]; rz(pi/9223372036854775808) q[0];";
     let run = Tzap::new(&["-", "--passes", "PhaseFoldRand", "--json"])
         .stdin(source)
         .run()
         .ok("preserved input");
-    assert!(
-        run.stderr
-            .contains("Warning: 1 angle expressions retained unchanged")
-    );
+    assert!(!run.stderr.contains("Warning:"));
     let report = Json::parse(&run.stdout);
-    assert_eq!(report.at("numerical/preserved_expressions").as_usize(), 1);
+    assert_eq!(report.at("numerical/preserved_expressions").as_usize(), 0);
     let run = Tzap::new(&["-", "--passes", "PhaseFoldRand", "--json", "-q"])
         .stdin(source)
         .run()
@@ -786,7 +783,7 @@ fn preserved_expression_warns_and_reports_its_input_policy() {
         Json::parse(&run.stdout)
             .at("numerical/preserved_expressions")
             .as_usize(),
-        1
+        0
     );
 }
 

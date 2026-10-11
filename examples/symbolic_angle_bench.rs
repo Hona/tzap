@@ -60,7 +60,9 @@ fn main() {
         black_box(black_box(&quarter).quarter_turns(RotationPeriod::TwoPi));
     });
     bench("legacy quarter-turn classification", count, || {
-        black_box(black_box(&old_quarter).quarter_turns());
+        black_box(
+            black_box(&old_quarter).quarter_turns(tzap::symbolic_angle::RotationPeriod::TwoPi),
+        );
     });
     let a = Angle::from_f64(0.25).unwrap();
     let b = Angle::from_f64(0.5).unwrap();

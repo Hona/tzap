@@ -67,3 +67,35 @@ pub(super) fn scale(bits: u64, power: i32, negative: bool) -> Option<Angle> {
     let (n, p) = parts(bits);
     encode(if negative { -n } else { n }, p + power)
 }
+
+/// Encode a proved binary rational without floating arithmetic.
+pub(super) fn from_rational(r: &super::Rational) -> Option<Angle> {
+    use num_traits::{Signed, ToPrimitive};
+    if let Some((n, d)) = r.as_small() {
+        if !d.is_power_of_two() {
+            return None;
+        }
+        return encode(n as i128, -(d.trailing_zeros() as i32));
+    }
+    let r = r.to_big_rational();
+    let d = r.denom();
+    if (d & (d - 1u32)) != num_bigint::BigInt::from(0) {
+        return None;
+    }
+    let mut n = r.numer().clone();
+    let shift = n.trailing_zeros()?;
+    n >>= shift as usize;
+    let magnitude = n.abs().to_u64()?;
+    if magnitude >> 53 != 0 {
+        return None;
+    }
+    let power = shift as i64 - (d.bits() as i64 - 1);
+    encode(
+        if n.is_negative() {
+            -(magnitude as i128)
+        } else {
+            magnitude as i128
+        },
+        power.try_into().ok()?,
+    )
+}

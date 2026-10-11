@@ -71,20 +71,19 @@ fn legacy_conversion_keeps_literal_coefficients_and_dyadics() {
             Angle::from_f64(value).unwrap()
         );
     }
-    for expression in ["2*pi+0.1", "4*pi-0.125", "pi*pi/4"] {
+    for expression in [
+        "2*pi+0.1",
+        "4*pi-0.125",
+        "pi*pi/4",
+        "pi/100000000000000000000",
+    ] {
         let circuit = qasm::parse(&format!("qreg q[1]; rz({expression}) q[0];")).unwrap();
-        let old = circuit.gates[0].angle().unwrap();
-        let (p, r) = old.components().unwrap();
-        let pi = ctx.pi_fraction(p.numerator(), p.denominator()).unwrap();
-        let residual = Angle::from_f64(r.get()).unwrap();
-        let expected = ctx.add(&pi, &residual).unwrap();
-        assert_eq!(from_legacy(&mut ctx, old).unwrap(), expected);
+        let angle = circuit.gates[0].angle().unwrap();
+        assert_eq!(
+            from_legacy(&mut ctx, angle).unwrap(),
+            ctx.parse(expression).unwrap()
+        );
     }
-    let preserved = crate::angle::Angle::preserved("pi/100000000000000000000".into(), 1);
-    assert_eq!(
-        from_legacy(&mut ctx, &preserved),
-        Err(IntegrationError::OpaqueLegacy)
-    );
 }
 
 #[test]

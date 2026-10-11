@@ -48,7 +48,7 @@ fn every_angle_gate_is_numeric_with_accurate_conversion_counts() {
             let output = qasm::serialize_numeric_lossy(&input).unwrap();
             assert!(!output.qasm.contains("pi"), "{gate:?}");
             assert_eq!(output.uncertified_conversions, 1, "{gate:?}");
-            let parsed = qasm::parse(&output.qasm).unwrap();
+            let parsed = qasm::parse_numeric_sdk(&output.qasm).unwrap();
             assert_eq!((parsed.num_qubits, parsed.num_cbits), (2, 3));
             assert_eq!(parsed.gates.last(), input.gates.last());
             for g in parsed.gates {
@@ -87,13 +87,18 @@ fn floats_remain_literal_and_preserved_expressions_are_rejected() {
         };
         let output = qasm::serialize_numeric_lossy(&input).unwrap();
         assert_eq!(output.uncertified_conversions, 0);
-        let parsed = qasm::parse(&output.qasm).unwrap();
+        let parsed = qasm::parse_numeric_sdk(&output.qasm).unwrap();
         for gate in parsed.gates {
             if let Some(a) = gate.angle() {
                 assert_eq!(a.components().unwrap().1.get().to_bits(), value.to_bits());
             }
         }
-        assert_eq!(qasm::serialize_sdk(&input).unwrap(), input.to_qasm());
+        assert_eq!(
+            qasm::parse_numeric_sdk(&qasm::serialize_sdk(&input).unwrap())
+                .unwrap()
+                .gates,
+            qasm::parse(&input.to_qasm()).unwrap().gates
+        );
     }
     let preserved = qasm::parse("qreg q[1]; rz(pi/9223372036854775808) q[0];")
         .unwrap()
@@ -107,12 +112,14 @@ fn floats_remain_literal_and_preserved_expressions_are_rejected() {
             num_cbits: 0,
             gates: vec![Gate::h(0), gate],
         };
-        for error in [
-            qasm::serialize_sdk(&input).unwrap_err(),
-            qasm::serialize_numeric_lossy(&input).unwrap_err(),
-        ] {
-            assert!(error.contains("gate 1") && error.contains("preserved"));
-        }
+        let error = qasm::serialize_sdk(&input).unwrap_err();
+        assert!(error.contains("gate 1"));
+        assert_eq!(
+            qasm::serialize_numeric_lossy(&input)
+                .unwrap()
+                .uncertified_conversions,
+            1
+        );
     }
 }
 
@@ -132,7 +139,7 @@ fn sdk_export_splits_large_mixed_angles_without_rounding() {
             let output = qasm::serialize_sdk(&input).unwrap();
             assert!(output.contains("t q[1]"));
             assert!(!output.contains("pi"));
-            let parsed = qasm::parse(&output).unwrap();
+            let parsed = qasm::parse_numeric_sdk(&output).unwrap();
             let angles: Vec<_> = parsed.gates.iter().filter_map(Gate::angle).collect();
             assert_eq!(angles.len(), 1);
             assert_eq!(
@@ -147,4 +154,42 @@ fn sdk_export_splits_large_mixed_angles_without_rounding() {
             );
         }
     }
+}
+
+#[test]
+fn sdk_export_splits_nonrepresentable_dyadic_sums_exactly() {
+    use num_rational::BigRational;
+    let mut ctx = tzap::angle::AngleContext::default();
+    let left = Angle::from_f64(0.1).unwrap();
+    let right = Angle::from_f64(0.2).unwrap();
+    let sum = ctx.add(&left, &right).unwrap();
+    assert!(sum.to_f64_exact().is_none());
+    let expected = left.as_rational().unwrap().to_big_rational()
+        + right.as_rational().unwrap().to_big_rational();
+    for gate in gates(&sum) {
+        let input = Circuit {
+            num_qubits: 2,
+            num_cbits: 0,
+            gates: vec![gate],
+        };
+        let text = qasm::serialize_sdk(&input).unwrap();
+        let output = qasm::parse_numeric_sdk(&text).unwrap();
+        let total: BigRational = output
+            .gates
+            .iter()
+            .filter_map(Gate::angle)
+            .map(|a| a.as_rational().unwrap().to_big_rational())
+            .sum();
+        assert_eq!(total, expected);
+        assert_eq!(
+            qasm::serialize_numeric_lossy(&input)
+                .unwrap()
+                .uncertified_conversions,
+            0
+        );
+    }
+    let source = qasm::parse("qreg q[1]; rz(0.1+0.2) q[0];").unwrap();
+    assert!(qasm::serialize_sdk(&source).is_err());
+    let tiny = qasm::parse("qreg q[1]; rz(1/2^1075) q[0];").unwrap();
+    assert!(qasm::serialize_sdk(&tiny).is_err());
 }

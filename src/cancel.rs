@@ -3,7 +3,11 @@
 use crate::circuit::{
     Circuit, Gate, Qubit, canonical_ccx, canonical_pair, canonical_triple, qubit_operands,
 };
-use crate::pass::Pass;
+use crate::pass::{Pass, PassState};
+use crate::symbolic_angle::{
+    Proof,
+    integration::{GateFamily, GateSemantics, Scope},
+};
 
 /// Working buffers shared by every sweep of one [`CancelGates::run`].
 ///
@@ -18,6 +22,7 @@ use crate::pass::Pass;
 /// deletes or rewrites in place, none grows the circuit), so one allocation
 /// at the input's size serves all of them.
 struct Scratch {
+    angles: crate::angle::AngleContext,
     /// Per-qubit ordered list of positions of the gates touching that qubit.
     tracks: Vec<Vec<usize>>,
     /// Gate-list length `tracks` was built for, or `None` when they are stale.
@@ -46,6 +51,7 @@ struct Scratch {
 impl Scratch {
     fn new(num_qubits: usize, gate_count: usize) -> Self {
         Self {
+            angles: crate::angle::AngleContext::default(),
             tracks: vec![Vec::new(); num_qubits],
             tracks_for: None,
             stacks: vec![Vec::new(); num_qubits],
@@ -106,13 +112,18 @@ impl Scratch {
 /// are cloned at the end.
 fn cancel_pairs(gates: &[Gate], scratch: &mut Scratch) -> Vec<Gate> {
     let stamp = scratch.begin();
-    let Scratch { stacks, delete, .. } = &mut *scratch;
+    let Scratch {
+        stacks,
+        delete,
+        angles,
+        ..
+    } = &mut *scratch;
     for stack in stacks.iter_mut() {
         stack.clear();
     }
 
     for (i, gate) in gates.iter().enumerate() {
-        if is_self_inverse(gate) {
+        if is_self_inverse(gate) || gate.angle().is_some() {
             let (n, qs) = qubit_operands(gate);
             // The blocker is the latest gate touching any of this gate's qubits.
             let mut blocker: Option<usize> = None;
@@ -125,7 +136,8 @@ fn cancel_pairs(gates: &[Gate], scratch: &mut Scratch) -> Vec<Gate> {
                 }
             }
             if let Some(block_idx) = blocker
-                && gates_equal(&gates[block_idx], gate)
+                && (gates_equal(&gates[block_idx], gate)
+                    || inverse_rotations(&gates[block_idx], gate, angles))
             {
                 // Cancel both gates; pop the blocker from all relevant qubit stacks.
                 delete[block_idx] = stamp;
@@ -155,6 +167,38 @@ fn cancel_pairs(gates: &[Gate], scratch: &mut Scratch) -> Vec<Gate> {
             .map(|(_, g)| g.clone()),
     );
     out
+}
+
+fn inverse_rotations(a: &Gate, b: &Gate, ctx: &mut crate::angle::AngleContext) -> bool {
+    if a.kind() != b.kind() || qubit_operands(a) != qubit_operands(b) {
+        return false;
+    }
+    let (Some(a), Some(angle)) = (a.angle(), b.angle()) else {
+        return false;
+    };
+    let family = match b {
+        Gate::p(..) => GateFamily::P,
+        Gate::rx(..) => GateFamily::Rx,
+        Gate::ry(..) => GateFamily::Ry,
+        Gate::rz(..) => GateFamily::Rz,
+        Gate::cp { .. } => GateFamily::Cp,
+        Gate::crx { .. } => GateFamily::Crx,
+        Gate::cry { .. } => GateFamily::Cry,
+        Gate::crz { .. } => GateFamily::Crz,
+        _ => return false,
+    };
+    match (GateSemantics {
+        family,
+        scope: Scope::ProjectiveCircuit,
+    })
+    .prove_inverse(ctx, a, angle)
+    {
+        Ok(proof) => proof == Proof::Proven,
+        Err(error) => {
+            crate::angle_stats::failure(error);
+            false
+        }
+    }
 }
 
 fn is_self_inverse(gate: &Gate) -> bool {
@@ -241,7 +285,7 @@ fn diagonal_k(g: &Gate, q: Qubit) -> Option<Option<u32>> {
         Gate::z(p) => (4, p),
         Gate::rz(theta, p) => {
             return if *p == q {
-                Some(theta.quarter_turns().map(|k| k as u32))
+                Some(theta.projective_quarters().map(|k| k as u32))
             } else {
                 None
             };
@@ -741,6 +785,9 @@ impl Pass for CancelGates {
         "Gate cancellation"
     }
     fn run(&self, circuit: &Circuit) -> Circuit {
+        self.run_with_state(circuit, &mut PassState::default())
+    }
+    fn run_with_state(&self, circuit: &Circuit, state: &mut PassState) -> Circuit {
         let lowered = crate::angle::lowered_if_needed(circuit);
         let circuit = &lowered;
         let n = circuit.num_qubits;
@@ -752,6 +799,7 @@ impl Pass for CancelGates {
         // pair.
         // One set of working buffers for every sweep below; see `Scratch`.
         let mut scratch = Scratch::new(n, circuit.gates.len());
+        std::mem::swap(&mut scratch.angles, &mut state.angles);
         let mut gates = cancel_pairs(&circuit.gates, &mut scratch);
         loop {
             let (reduced, reduce_changed) = reduce_hadamards(gates, &mut scratch);
@@ -768,6 +816,7 @@ impl Pass for CancelGates {
         for gate in gates {
             output.apply(gate);
         }
+        std::mem::swap(&mut scratch.angles, &mut state.angles);
         output
     }
 }

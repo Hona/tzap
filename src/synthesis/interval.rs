@@ -5,7 +5,7 @@ use num_integer::Integer;
 use num_traits::{Signed, Zero};
 
 #[derive(Clone, Debug)]
-pub(super) struct Interval {
+pub(crate) struct Interval {
     pub lo: BigInt,
     pub hi: BigInt,
 }
@@ -63,7 +63,7 @@ impl Interval {
     }
 }
 
-pub(super) struct Context {
+pub(crate) struct Context {
     pub bits: usize,
     pub unit: BigInt,
 }

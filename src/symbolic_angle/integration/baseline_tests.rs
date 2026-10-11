@@ -28,14 +28,8 @@ fn native_fixture_converts_each_accepted_literal_without_period_reduction() {
         };
         families[index] += 1;
         let old = gate.angle().unwrap();
-        let (pi, residual) = old.components().unwrap();
-        let angle = from_legacy(&mut ctx, old).unwrap();
-        let coefficient = ctx.pi_fraction(pi.numerator(), pi.denominator()).unwrap();
-        let numeric = ctx.sub(&angle, &coefficient).unwrap();
-        assert_eq!(
-            numeric.as_rational().unwrap().to_big_rational(),
-            binary(residual.get())
-        );
+        assert_eq!(from_legacy(&mut ctx, old).unwrap(), *old);
+        assert_eq!(ctx.parse(&old.to_string()).unwrap(), *old);
     }
     assert_eq!(families, [1, 2, 1, 1, 2, 1, 1, 2]);
 }
@@ -57,8 +51,8 @@ fn native_fixture_keeps_current_optimization_synthesis_and_sdk_guarantees() {
         assert!(circuits_equiv(&input, &output, 1e-12));
         let round_trip = qasm::parse(&output.to_qasm()).unwrap();
         assert!(circuits_equiv(&input, &round_trip, 1e-12));
-        let sdk = qasm::parse(&qasm::serialize_sdk(&output).unwrap()).unwrap();
-        assert!(circuits_equiv(&input, &sdk, 1e-12));
+        // The exact decimal 5e-324 cannot be exported as a binary64 parameter.
+        assert!(qasm::serialize_sdk(&output).is_err());
     }
     let output = DecomposeRotations { epsilon: 1e-10 }
         .try_run(&input)
@@ -66,29 +60,4 @@ fn native_fixture_keeps_current_optimization_synthesis_and_sdk_guarantees() {
     assert!(output.gates.iter().all(|gate| gate.angle().is_none()));
     // Numerical comparison supplements the independent certificate checks in synthesis tests.
     assert!(circuits_equiv(&input, &output, 2e-9));
-}
-
-// Independent binary64 decoding, without arithmetic on the input float.
-fn binary(value: f64) -> num_rational::BigRational {
-    use num_bigint::BigInt;
-    use num_rational::BigRational;
-    let bits = value.to_bits();
-    let exponent = ((bits >> 52) & 2047) as i32;
-    let mantissa = bits & ((1 << 52) - 1);
-    let significand = if exponent == 0 {
-        mantissa
-    } else {
-        mantissa | (1 << 52)
-    };
-    let power = if exponent == 0 {
-        -1074
-    } else {
-        exponent - 1075
-    };
-    let signed = BigInt::from(significand) * if bits >> 63 == 0 { 1 } else { -1 };
-    if power >= 0 {
-        BigRational::from_integer(signed << power as usize)
-    } else {
-        BigRational::new(signed, BigInt::from(1) << (-power) as usize)
-    }
 }

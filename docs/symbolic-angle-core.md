@@ -1,9 +1,10 @@
-# Standalone symbolic angle core
+# Symbolic angle core
 
 `tzap::symbolic_angle` represents exact, nonperiodic real scalar expressions.
 It provides the data structure and its arithmetic, normalization, proof queries,
-parser, and interner. Circuit gates, optimization passes, QASM handling, synthesis,
-and the existing `tzap::angle::Angle` continue to use their existing representation.
+parser, and interner. `tzap::angle::Angle` re-exports this type; circuits and
+optimization passes now use it throughout. Native QASM expressions use exact
+decimals, while SDK binary64 inputs retain their exact dyadic meanings.
 
 ## Construction and arithmetic
 
@@ -122,14 +123,38 @@ in another context, subject to that context's input and resource limits. Large
 dyadic-to-rational conversions and text output can allocate, even when the
 original binary64 input was inline.
 
-Certified numerical evaluation, arbitrary-precision trig evaluation, synthesis,
-and runtime circuit integration are future layers. Function values currently
-remain symbolic whenever an exact simplification is unavailable.
+Function values remain symbolic whenever an exact simplification is unavailable.
+At explicit synthesis boundaries, an integer interval evaluator encloses all six
+functions and composite expressions. It bounds precision at 2,048 bits, expanded
+nodes at 4,096, depth at 64, work at 4,000,000 units and magnitude. Unresolved
+domains or exhausted limits fail explicitly. The existing independent gate-word
+verifier certifies the complete target, including controlled branch phases.
+Approximation occurs only at synthesis or explicitly lossy export.
+
+## Pass integration
+
+`PassState` owns a weak interner and an aggregate work budget for general
+expressions and large coefficients. Common named phases and compact numeric
+values use fixed-cost paths; general expressions cannot consume unlimited work
+across fixpoint sweeps. Standalone `AngleContext` operations retain their
+per-operation budgets. Angles remain valid across contexts and after runs finish.
+
+Cancellation proves symbolic inverses for all eight gate families using their
+appropriate periods. Random and Pauli phase folding perform exact bounded
+merges before committing gate deletion or frame changes. General `CnotMin`
+phases accumulate sparsely and normalize once; any arithmetic or finalization
+failure restores its saved original chunk. Named Clifford+T phases stay inline.
+Other passes preserve symbolic rotations as boundaries of their discrete domains.
+
+The numerical report input policy is `exact_symbolic`. Legacy preserved-source,
+numeric-fallback, rounded-fold and nonfinite-fold counters remain for compatibility
+and are zero for exact symbolic processing. Resource-limited folds are counted
+in `skipped_coefficient_limit_folds`. Random Boolean matching retains its existing
+probabilistic contract independently of exact angle arithmetic.
 
 ## Integration adapters
 
-`symbolic_angle::integration` prepares gate integration without changing existing
-circuit storage or pass behavior. `GateSemantics` requires a `GateFamily` and
+`symbolic_angle::integration` supplies gate-aware semantics for circuit integration. `GateSemantics` requires a `GateFamily` and
 `Scope`: literal operators use a `4*pi` period for RX/RY/RZ, while executed
 circuits up to global phase may use `2*pi`. Controlled RX/RY/RZ always use
 `4*pi`; P and CP use `2*pi`. Identity and inverse queries return proofs, never
@@ -145,9 +170,8 @@ shapes and coincident control and target wires return errors. Operand range
 checks belong to the circuit consumer. This adapter does not create or optimize
 reusable gate bodies.
 
-`integration::from_legacy` preserves the old angle's literal pi coefficient and
-the exact dyadic residual. It rejects opaque preserved expressions rather than
-reparsing them under an implicit source policy. The input fixture and independent
+`integration::from_legacy` remains as a compatibility entry point; it validates
+the now-identical scalar type against the destination context limits. The input fixture and independent
 binary64 oracle test this conversion across all eight native angle families.
 
 `PhaseAccumulator::new(period, limits)` adds in an explicitly periodic gate
@@ -166,7 +190,7 @@ updates retain its previous values, while attempted work can consume budget.
 remaining work. Callers must finalize successfully before changing a circuit or
 Pauli frame. Atoms are owned and can originate from other or expired contexts.
 An internal borrowed expression view supplies node structure to formatting and
-future certified evaluation without exposing fingerprints or interner keys.
+certified evaluation without exposing fingerprints or interner keys.
 
 The original 37 core tests are supplemented by 13 unit regressions for the
 adapters, accumulation, and circuit baseline, plus two integration tests using

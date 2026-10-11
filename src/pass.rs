@@ -1,5 +1,25 @@
 use crate::circuit::{Circuit, Gate, qubit_operands};
 
+/// Per-pipeline exact arithmetic state. Workers own independent contexts.
+/// Stored circuit angles own their nodes and outlive this state.
+pub struct PassState {
+    pub angles: crate::angle::AngleContext,
+}
+impl Default for PassState {
+    fn default() -> Self {
+        Self {
+            angles: crate::angle::AngleContext::default().with_run_budget(),
+        }
+    }
+}
+impl PassState {
+    pub fn with_limits(limits: crate::angle::Limits) -> Self {
+        Self {
+            angles: crate::angle::AngleContext::with_limits(limits).with_run_budget(),
+        }
+    }
+}
+
 /// A circuit pass. The default output keeps optimization pipelines gate-based;
 /// terminal conversions can select a different output type. Whole-circuit gate
 /// passes retain the input qubit and classical-bit counts.
@@ -12,6 +32,9 @@ use crate::circuit::{Circuit, Gate, qubit_operands};
 pub trait Pass<Output = Circuit> {
     fn name(&self) -> &str;
     fn run(&self, circuit: &Circuit) -> Output;
+    fn run_with_state(&self, circuit: &Circuit, _state: &mut PassState) -> Output {
+        self.run(circuit)
+    }
 }
 
 /// The outcome of [`run_passes`].
@@ -28,8 +51,9 @@ pub fn run_passes(circuit: &Circuit, passes: &[&dyn Pass]) -> PassResult {
     let mut c = circuit.clone();
     let mut t_after_first = 0;
     let mut gates_after_first = 0;
+    let mut state = PassState::default();
     for (i, p) in passes.iter().enumerate() {
-        c = p.run(&c);
+        c = p.run_with_state(&c, &mut state);
         if i == 0 {
             t_after_first = count_t(&c);
             gates_after_first = c.gates.len();

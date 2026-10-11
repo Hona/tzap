@@ -1,29 +1,10 @@
-//! Checked angle values. Floats denote their exact binary64 value; explicit
-//! pi coefficients denote rational multiples of mathematical pi.
+//! Exact scalar angles and explicit projective gate helpers.
 use crate::circuit::{Circuit, Gate, Qubit};
-use std::{fmt, sync::Arc};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AngleError {
-    NonFinite,
-    DivisionByZero,
-    RepresentationLimit,
-    RoundedAddition,
-    PreservedExpression,
-}
-impl fmt::Display for AngleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NonFinite => "angle must be finite",
-            Self::DivisionByZero => "angle expression must be finite: division by zero",
-            Self::RepresentationLimit => "angle coefficient exceeds the fixed-width representation",
-            Self::RoundedAddition => "angle addition would round",
-            Self::PreservedExpression => "preserved angle expression cannot be folded",
-        })
-    }
-}
-impl std::error::Error for AngleError {}
-
+pub use crate::symbolic_angle::{
+    Angle, AngleContext, Error as AngleError, Limits, Proof, RotationPeriod,
+};
+use crate::symbolic_angle::{Rational, view::ExpressionRef};
+use num_traits::ToPrimitive;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PiFraction {
     numerator: i64,
@@ -126,40 +107,6 @@ impl PiFraction {
         let d = self.denominator as i128;
         (n % d == 0).then(|| (n / d).rem_euclid(8) as u8)
     }
-    pub(crate) fn decimal(source: &str) -> Result<Self, AngleError> {
-        let (mantissa, exponent) = source.split_once(['e', 'E']).unwrap_or((source, "0"));
-        let exponent: i32 = exponent
-            .parse()
-            .map_err(|_| AngleError::RepresentationLimit)?;
-        let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-        let mut digits = format!("{whole}{frac}");
-        let mut scale = (frac.len() as i64) - (exponent as i64);
-        while digits.ends_with('0') && digits.len() > 1 {
-            digits.pop();
-            scale -= 1;
-        }
-        let n: i128 = digits
-            .parse()
-            .map_err(|_| AngleError::RepresentationLimit)?;
-        if n == 0 {
-            return Ok(Self::ZERO);
-        }
-        if scale.unsigned_abs() > 38 {
-            return Err(AngleError::RepresentationLimit);
-        }
-        let power = 10i128
-            .checked_pow(scale.unsigned_abs() as u32)
-            .ok_or(AngleError::RepresentationLimit)?;
-        if scale >= 0 {
-            Self::wide(n, power)
-        } else {
-            Self::wide(
-                n.checked_mul(power)
-                    .ok_or(AngleError::RepresentationLimit)?,
-                1,
-            )
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,9 +122,6 @@ impl FiniteF64 {
                 value
             }))
         }
-    }
-    fn is_zero(self) -> bool {
-        self.0.to_bits() == 0
     }
     pub fn get(self) -> f64 {
         self.0
@@ -263,218 +207,119 @@ fn float_sum_matches_bits(a: f64, b: f64, sum: f64) -> bool {
     actual == normalized(negative, magnitude, exponent)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Symbolic {
-    Affine { pi: PiFraction, radians: FiniteF64 },
-    Preserved { source: String, line: usize },
-}
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Value {
-    Float(FiniteF64),
-    NumericFallback(FiniteF64),
-    Turns(u8),
-    Symbolic(Arc<Symbolic>),
-}
-/// Immutable, validated angle. No public unchecked payload construction.
-#[derive(Clone, Debug)]
-pub struct Angle(Value);
-impl PartialEq for Angle {
-    fn eq(&self, rhs: &Self) -> bool {
-        match (self.components(), rhs.components()) {
-            (Some((a, ar)), Some((b, br))) => {
-                a.normalized_rotation() == b.normalized_rotation() && ar == br
-            }
-            (None, None) => match (&self.0, &rhs.0) {
-                (Value::Symbolic(a), Value::Symbolic(b)) => match (&**a, &**b) {
-                    (
-                        Symbolic::Preserved { source: a, .. },
-                        Symbolic::Preserved { source: b, .. },
-                    ) => a == b,
-                    _ => false,
-                },
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-}
-impl Eq for Angle {}
-impl std::hash::Hash for Angle {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        if let Some((pi, r)) = self.components() {
-            0u8.hash(state);
-            pi.normalized_rotation().hash(state);
-            r.hash(state);
-        } else if let Value::Symbolic(s) = &self.0 {
-            if let Symbolic::Preserved { source, .. } = &**s {
-                1u8.hash(state);
-                source.hash(state);
-            }
-        }
-    }
-}
 impl Angle {
-    /// Compare literal values without the projective 2π rotation equivalence.
     pub(crate) fn literal_eq(&self, rhs: &Self) -> bool {
-        match (self.components(), rhs.components()) {
-            (Some(a), Some(b)) => a == b,
-            (None, None) => self == rhs,
-            _ => false,
-        }
+        self == rhs
     }
-    /// Exact half-angle for controlled lowering; never reduce modulo 2π.
     pub(crate) fn checked_half(&self) -> Result<Self, AngleError> {
-        let (pi, r) = self.components().ok_or(AngleError::PreservedExpression)?;
-        let half = r.get() / 2.0;
-        if !float_sum_matches_bits(half, half, r.get()) {
-            return Err(AngleError::RoundedAddition);
-        }
-        Ok(Self::affine(
-            pi.checked_div(PiFraction::new(2, 1)?)?,
-            FiniteF64::new(half)?,
-        ))
+        AngleContext::default().half(self)
     }
     pub(crate) fn literal_neg(&self) -> Result<Self, AngleError> {
-        let (pi, r) = self.components().ok_or(AngleError::PreservedExpression)?;
-        Ok(Self::affine(pi.checked_neg()?, FiniteF64::new(-r.get())?))
+        AngleContext::default().neg(self)
     }
-    pub fn from_f64(value: f64) -> Result<Self, AngleError> {
-        Ok(Self(Value::Float(FiniteF64::new(value)?)))
-    }
-    pub fn pi_fraction(n: i64, d: i64) -> Result<Self, AngleError> {
-        Ok(Self::affine(PiFraction::new(n, d)?, FiniteF64(0.0)))
+    /// Literal scalar negation; callers select a gate period separately.
+    pub fn checked_neg(&self) -> Result<Self, AngleError> {
+        self.literal_neg()
     }
     pub(crate) fn turns(k: u8) -> Self {
-        Self(Value::Turns(k & 7))
+        // Named P/T phases are intentionally viewed modulo 2*pi.
+        Self::phase_quarters(k)
     }
-    pub(crate) fn numeric_fallback(value: f64) -> Result<Self, AngleError> {
-        Ok(Self(Value::NumericFallback(FiniteF64::new(value)?)))
-    }
-    pub(crate) fn preserved(source: String, line: usize) -> Self {
-        Self(Value::Symbolic(Arc::new(Symbolic::Preserved {
-            source,
-            line,
-        })))
-    }
-    pub(crate) fn affine(pi: PiFraction, radians: FiniteF64) -> Self {
-        if pi.numerator == 0 {
-            Self(Value::Float(radians))
-        } else {
-            Self(Value::Symbolic(Arc::new(Symbolic::Affine { pi, radians })))
-        }
-    }
+    /// Compatibility classification: available only for a bounded pi coefficient
+    /// and an exactly representable binary64 residual. Never used for arithmetic.
     pub fn components(&self) -> Option<(PiFraction, FiniteF64)> {
-        match &self.0 {
-            Value::Float(r) | Value::NumericFallback(r) => Some((PiFraction::ZERO, *r)),
-            Value::Turns(k) => Some((PiFraction::new(*k as i64, 4).unwrap(), FiniteF64(0.0))),
-            Value::Symbolic(s) => match **s {
-                Symbolic::Affine { pi, radians } => Some((pi, radians)),
-                _ => None,
-            },
+        if let Some(r) = self.to_f64_exact() {
+            return Some((PiFraction::ZERO, FiniteF64(r)));
         }
-    }
-    pub fn is_preserved(&self) -> bool {
-        self.components().is_none()
-    }
-    pub fn used_numeric_fallback(&self) -> bool {
-        matches!(self.0, Value::NumericFallback(_))
-    }
-    pub fn quarter_turns(&self) -> Option<u8> {
-        match &self.0 {
-            Value::Turns(k) => Some(*k),
-            Value::Float(r) | Value::NumericFallback(r) => {
-                if r.is_zero() {
-                    Some(0)
+        if let Some(p) = self.pi_coefficient() {
+            let (n, d) = p.as_small()?;
+            return Some((PiFraction::new(n, d.try_into().ok()?).ok()?, FiniteF64(0.0)));
+        }
+        if let ExpressionRef::Sum(terms) = self.expression() {
+            let mut p = PiFraction::ZERO;
+            let mut r = 0.0;
+            for (coefficient, atom) in terms {
+                if atom == &Self::PI {
+                    let (n, d) = coefficient.as_small()?;
+                    p = PiFraction::new(n, d.try_into().ok()?).ok()?;
+                } else if atom == &Self::ONE {
+                    let big = coefficient.to_big_rational();
+                    r = big.to_f64()?;
+                    if Rational::from_bits(r.to_bits()) != *coefficient {
+                        return None;
+                    }
                 } else {
-                    None
+                    return None;
                 }
             }
-            Value::Symbolic(s) => match &**s {
-                Symbolic::Affine { pi, radians } if radians.is_zero() => pi.quarter_turns(),
-                _ => None,
-            },
+            return Some((p, FiniteF64::new(r).ok()?));
         }
+        None
+    }
+    pub fn is_preserved(&self) -> bool {
+        false
+    }
+    pub fn used_numeric_fallback(&self) -> bool {
+        false
     }
     pub fn is_zero(&self) -> bool {
-        self.quarter_turns() == Some(0)
-    }
-    pub fn checked_neg(&self) -> Result<Self, AngleError> {
-        if let Some(k) = self.quarter_turns() {
-            return Ok(Self::turns(8u8.wrapping_sub(k)));
-        }
-        let (pi, r) = self.components().ok_or(AngleError::PreservedExpression)?;
-        Ok(Self::affine(
-            pi.normalized_rotation().checked_neg()?,
-            FiniteF64::new(-r.0)?,
-        )
-        .normalized())
+        self.prove_zero() == Proof::Proven
     }
     pub fn checked_add_signed(&self, sign: i8, rhs: &Self) -> Result<Self, AngleError> {
-        let result = self.add_signed(sign, rhs);
+        self.add_signed_with(&mut AngleContext::default(), sign, rhs)
+    }
+    pub(crate) fn add_signed_with(
+        &self,
+        ctx: &mut AngleContext,
+        sign: i8,
+        rhs: &Self,
+    ) -> Result<Self, AngleError> {
+        assert!(sign == 1 || sign == -1);
+        let result = if sign == 1 {
+            ctx.add(self, rhs)
+        } else {
+            ctx.sub(rhs, self)
+        };
         if let Err(error) = result {
             crate::angle_stats::failure(error);
         }
         result
     }
-    fn add_signed(&self, sign: i8, rhs: &Self) -> Result<Self, AngleError> {
-        assert!(sign == 1 || sign == -1);
-        if let (Some(a), Some(b)) = (self.quarter_turns(), rhs.quarter_turns()) {
-            return Ok(Self::turns(
-                (sign as i16 * a as i16 + b as i16).rem_euclid(8) as u8,
-            ));
+    #[inline]
+    pub(crate) fn merge_phases_with(
+        &self,
+        ctx: &mut AngleContext,
+        sign: i8,
+        rhs: &Self,
+    ) -> Result<Self, AngleError> {
+        let result = ctx.merge_phases(self, sign, rhs);
+        if let Err(error) = result {
+            crate::angle_stats::failure(error);
         }
-        let (a, ar) = self.components().ok_or(AngleError::PreservedExpression)?;
-        let (b, br) = rhs.components().ok_or(AngleError::PreservedExpression)?;
-        let a = a.normalized_rotation();
-        let a = if sign < 0 { a.checked_neg()? } else { a };
-        let pi = a
-            .checked_add(b.normalized_rotation())?
-            .normalized_rotation();
-        let radians = exact_float_add(FiniteF64(if sign < 0 { -ar.0 } else { ar.0 }), br)?;
-        Ok(Self::affine(pi, radians))
+        result
     }
-    pub fn normalized(&self) -> Self {
-        if matches!(
-            self.0,
-            Value::Turns(_) | Value::Float(_) | Value::NumericFallback(_)
-        ) {
-            return self.clone();
-        }
-        match self.components() {
-            Some((p, r)) => {
-                let p = p.normalized_rotation();
-                if r.is_zero() {
-                    if let Some(k) = p.quarter_turns() {
-                        return Self::turns(k);
-                    }
-                }
-                Self::affine(p, r)
-            }
-            None => self.clone(),
-        }
+    pub(crate) fn projective_quarters(&self) -> Option<u8> {
+        self.quarter_turns(RotationPeriod::TwoPi)
     }
-    /// Explicit, uncertified numerical conversion for synthesis/test oracles.
-    /// This is never used by folding or exact classification.
+    pub(crate) fn projective_identity(&self) -> bool {
+        self.prove_identity(RotationPeriod::TwoPi) == Proof::Proven
+    }
+    /// Explicit, uncertified evaluation for diagnostics and lossy export only.
     pub fn to_f64_lossy(&self) -> Result<f64, AngleError> {
-        let (pi, r) = self.components().ok_or(AngleError::PreservedExpression)?;
-        FiniteF64::new((pi.numerator as f64 / pi.denominator as f64) * std::f64::consts::PI + r.0)
-            .map(FiniteF64::get)
+        crate::symbolic_angle::evaluate::lossy(self)
     }
     pub(crate) fn emitted_gate_count(&self) -> usize {
-        match self.quarter_turns() {
+        match self.projective_quarters() {
             Some(0) => 0,
             Some(3 | 5) => 2,
-            Some(_) => 1,
-            None => match self.components() {
-                Some((pi, r)) if pi.numerator() != 0 && !r.is_zero() => {
-                    Self::affine(pi, FiniteF64(0.0)).emitted_gate_count() + 1
-                }
-                _ => 1,
-            },
+            None => self
+                .affine_parts()
+                .map_or(1, |(p, _)| p.emitted_gate_count() + 1),
+            _ => 1,
         }
     }
     pub(crate) fn try_emit(&self, q: Qubit, push: &mut impl FnMut(Gate) -> bool) -> bool {
-        match self.quarter_turns() {
+        match self.projective_quarters() {
             Some(0) => true,
             Some(1) => push(Gate::t(q)),
             Some(2) => push(Gate::s(q)),
@@ -483,26 +328,23 @@ impl Angle {
             Some(5) => push(Gate::z(q)) && push(Gate::t(q)),
             Some(6) => push(Gate::sdg(q)),
             Some(7) => push(Gate::tdg(q)),
-            _ => match self.components() {
-                Some((pi, r)) if pi.numerator != 0 && !r.is_zero() => {
-                    Self::affine(pi.normalized_rotation(), FiniteF64(0.0)).try_emit(q, push)
-                        && push(Gate::rz(Self(Value::Float(r)), q))
-                }
-                _ => push(Gate::rz(self.normalized(), q)),
+            _ => match self.affine_parts() {
+                Some((p, r)) => p.try_emit(q, push) && push(Gate::rz(r, q)),
+                None => push(Gate::rz(self.clone(), q)),
             },
         }
     }
     pub(crate) fn rotation_gates(&self, q: Qubit) -> Vec<Gate> {
         let mut gates = Vec::with_capacity(self.emitted_gate_count());
-        self.try_emit(q, &mut |gate| {
-            gates.push(gate);
+        self.try_emit(q, &mut |g| {
+            gates.push(g);
             true
         });
         gates
     }
-    pub(crate) fn emit(&self, output: &mut Circuit, q: Qubit) {
-        self.try_emit(q, &mut |gate| {
-            output.apply(gate);
+    pub(crate) fn emit(&self, out: &mut Circuit, q: Qubit) {
+        self.try_emit(q, &mut |g| {
+            out.apply(g);
             true
         });
     }
@@ -516,24 +358,6 @@ impl Angle {
             Gate::rz(a, _) | Gate::p(a, _) | Gate::rx(a, _) | Gate::ry(a, _) => Some(a.clone()),
             _ => None,
         }
-    }
-}
-impl fmt::Display for Angle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Value::Symbolic(s) = &self.0 {
-            if let Symbolic::Preserved { source, .. } = &**s {
-                return f.write_str(source);
-            }
-        }
-        let (pi, r) = self.components().unwrap();
-        if pi.numerator == 0 {
-            return write!(f, "{}", real_token(r.0));
-        }
-        write!(f, "({}*pi/{})", pi.numerator, pi.denominator)?;
-        if !r.is_zero() {
-            write!(f, "+({})", real_token(r.0))?;
-        }
-        Ok(())
     }
 }
 pub(crate) fn real_token(value: f64) -> String {
@@ -556,7 +380,7 @@ pub fn lower_exact_rotations(circuit: &Circuit) -> Circuit {
     let mut out = Circuit::with_cbits(circuit.num_qubits, circuit.num_cbits);
     for g in &circuit.gates {
         match g {
-            Gate::rz(a, q) if a.quarter_turns().is_some() => a.emit(&mut out, *q),
+            Gate::rz(a, q) if a.projective_quarters().is_some() => a.emit(&mut out, *q),
             _ => out.apply(g.clone()),
         }
     }
@@ -568,7 +392,7 @@ pub(crate) fn lowered_if_needed(circuit: &Circuit) -> std::borrow::Cow<'_, Circu
     if circuit
         .gates
         .iter()
-        .any(|g| matches!(g, Gate::rz(a, _) if a.quarter_turns().is_some()))
+        .any(|g| matches!(g, Gate::rz(a, _) if a.projective_quarters().is_some()))
     {
         std::borrow::Cow::Owned(lower_exact_rotations(circuit))
     } else {

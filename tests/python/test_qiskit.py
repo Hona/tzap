@@ -375,7 +375,7 @@ def test_private_qasm_bridge_emits_flat_registers_and_all_operand_kinds():
 
     assert "qreg q[3];" in bridge
     assert "creg c[1];" in bridge
-    assert "rz(0.25) q[0];" in bridge
+    assert "rz((1/4)) q[0];" in bridge
     assert "cx q[0],q[1];" in bridge
     assert "ccz q[0],q[1],q[2];" in bridge
     assert "measure q[2] -> c[0];" in bridge

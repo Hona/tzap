@@ -4,8 +4,9 @@ use std::hash::{BuildHasher, Hasher};
 
 use rustc_hash::FxHashMap;
 
+use crate::angle::AngleContext;
 use crate::circuit::{Circuit, Gate, Qubit};
-use crate::pass::Pass;
+use crate::pass::{Pass, PassState};
 
 /// A random evaluation of a Boolean polynomial in GF(2^128), together with
 /// an upper bound on its total degree. Addition is XOR; multiplication is
@@ -78,10 +79,16 @@ impl Pass for PhaseFoldRand {
     fn run(&self, circuit: &Circuit) -> Circuit {
         phase_fold_rand(circuit)
     }
+    fn run_with_state(&self, circuit: &Circuit, state: &mut PassState) -> Circuit {
+        phase_fold_rand_with_context(circuit, &mut state.angles)
+    }
 }
 
 /// Free-function form of [`PhaseFoldRand`], for use outside a [`Pass`] pipeline.
 pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
+    phase_fold_rand_with_context(circuit, &mut PassState::default().angles)
+}
+fn phase_fold_rand_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Circuit {
     let n = circuit.num_qubits;
     let mut qubits: Vec<Fingerprint> = (0..n).map(|_| fresh_fingerprint()).collect();
 
@@ -100,6 +107,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::tdg(q) => record_int(
                 &qubits,
@@ -109,6 +117,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::s(q) => record_int(
                 &qubits,
@@ -118,6 +127,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::sdg(q) => record_int(
                 &qubits,
@@ -127,6 +137,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::z(q) => record_int(
                 &qubits,
@@ -136,6 +147,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::rz(theta, q) => record_angle(
                 &qubits,
@@ -145,6 +157,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::p(..)
             | Gate::y(_)
@@ -221,17 +234,11 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
     }
 
     for lp in &live {
-        let angle = if lp.current_sign {
-            lp.angle
-                .checked_neg()
-                .expect("only mergeable angles are tracked")
-        } else {
-            lp.angle.clone()
-        };
+        let angle = lp.angle.clone();
         if lp.input_gates == 1 && angle.emitted_gate_count() > 1 {
             continue;
         }
-        if angle.is_zero() {
+        if angle.projective_identity() {
             skip[lp.current_idx] = true;
         } else {
             emit_at[lp.current_idx] = Some((lp.qubit, angle));
@@ -254,6 +261,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_int(
     qubits: &[Fingerprint],
     q: Qubit,
@@ -262,9 +270,11 @@ fn record_int(
     live: &mut Vec<LivePhase>,
     groups: &mut FxHashMap<u128, usize>,
     skip: &mut [bool],
+    ctx: &mut AngleContext,
 ) {
-    record_angle(qubits, q, Angle::turns(k), idx, live, groups, skip);
+    record_angle(qubits, q, Angle::turns(k), idx, live, groups, skip, ctx);
 }
+#[allow(clippy::too_many_arguments)]
 fn record_angle(
     qubits: &[Fingerprint],
     q: Qubit,
@@ -273,38 +283,36 @@ fn record_angle(
     live: &mut Vec<LivePhase>,
     groups: &mut FxHashMap<u128, usize>,
     skip: &mut [bool],
+    ctx: &mut AngleContext,
 ) {
-    if angle.is_preserved() {
-        return;
-    }
     let value = qubits[q as usize].value;
     if value == 0 || value == FIELD_ONE {
         skip[idx] = true;
         return;
     }
     let (key, complement) = canonical_fingerprint(value);
-    let signed = if complement {
-        angle.checked_neg().expect("validated rotation")
-    } else {
-        angle
-    };
     if let Some(&gi) = groups.get(&key) {
-        if let Ok(merged) = live[gi].angle.checked_add_signed(1, &signed) {
-            if merged.emitted_gate_count() <= live[gi].input_gates + 1 {
-                skip[live[gi].current_idx] = true;
-                live[gi].angle = merged;
-                live[gi].current_idx = idx;
-                live[gi].qubit = q;
-                live[gi].current_sign = complement;
-                live[gi].input_gates += 1;
-                return;
-            }
+        let sign = if live[gi].current_sign == complement {
+            1
+        } else {
+            -1
+        };
+        if let Ok(merged) = live[gi].angle.merge_phases_with(ctx, sign, &angle)
+            && merged.emitted_gate_count() <= live[gi].input_gates + 1
+        {
+            skip[live[gi].current_idx] = true;
+            live[gi].angle = merged;
+            live[gi].current_idx = idx;
+            live[gi].qubit = q;
+            live[gi].current_sign = complement;
+            live[gi].input_gates += 1;
+            return;
         }
         // Leave the earlier group live for finalization and start a new one.
     }
     let gi = live.len();
     live.push(LivePhase {
-        angle: signed,
+        angle,
         qubit: q,
         current_idx: idx,
         current_sign: complement,
@@ -316,6 +324,7 @@ fn record_angle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::angle::AngleContext;
     use crate::decompose::DecomposeToffoli;
     use crate::pass::Pass;
     use crate::unitary::circuits_equiv;
@@ -332,8 +341,9 @@ mod tests {
         let mut live = Vec::new();
         let mut groups = FxHashMap::default();
         let mut skip = [false; 2];
-        record_int(&qubits, 0, 1, 0, &mut live, &mut groups, &mut skip);
-        record_int(&qubits, 1, 1, 1, &mut live, &mut groups, &mut skip);
+        let ctx = &mut AngleContext::default();
+        record_int(&qubits, 0, 1, 0, &mut live, &mut groups, &mut skip, ctx);
+        record_int(&qubits, 1, 1, 1, &mut live, &mut groups, &mut skip, ctx);
         assert!(skip[0]);
         let mut input = Circuit::new(2);
         input.gates = vec![Gate::t(0), Gate::t(1)];

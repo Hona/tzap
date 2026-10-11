@@ -981,7 +981,7 @@ mod tests {
         let s = format!("{c}");
         assert!(s.contains("t q0"));
         assert!(s.contains("s q0"));
-        assert!(s.contains("rz((1*pi/4)) q0"));
+        assert!(s.contains(&format!("rz({}) q0", c.gates[2].angle().unwrap())));
         println!("{c}");
     }
 

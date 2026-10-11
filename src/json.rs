@@ -391,7 +391,7 @@ pub(crate) fn render(
         (
             "numerical",
             Value::Object(vec![
-                ("input_policy", Value::str("accepted_angles")),
+                ("input_policy", Value::str("exact_symbolic")),
                 ("folding", Value::str("no_added_rounding")),
                 (
                     "preserved_expressions",

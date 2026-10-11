@@ -19,3 +19,9 @@ def angle_radians(source: str) -> float:
     if not math.isfinite(result):
         raise ValueError("SDK angle must be finite")
     return result
+
+
+def exact_float_expression(value: float) -> str:
+    """Encode the exact binary64 input, independently of decimal QASM semantics."""
+    numerator, denominator = value.as_integer_ratio()
+    return f"({numerator}/{denominator})"

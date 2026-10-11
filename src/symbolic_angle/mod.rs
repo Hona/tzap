@@ -1,7 +1,6 @@
-//! Standalone exact, nonperiodic scalar angles.
+//! Exact, nonperiodic scalar angles used throughout circuits and passes.
 //!
-//! This module does not change [`crate::angle::Angle`], circuits, parsers, or
-//! optimization passes. Use an [`AngleContext`] to construct and intern closed
+//! [`crate::angle::Angle`] re-exports this type. Use an [`AngleContext`] to construct and intern closed
 //! real expressions. Arithmetic never numerically evaluates a function.
 //!
 //! ```
@@ -18,6 +17,7 @@
 mod accumulate;
 mod context;
 mod dyadic;
+pub(crate) mod evaluate;
 pub mod integration;
 mod parse;
 mod rational;
@@ -68,8 +68,11 @@ pub enum Resource {
     Output,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    RepresentationLimit,
+    RoundedAddition,
+    PreservedExpression,
     NonFinite,
     DivisionByZero,
     ZeroPowerZero,
@@ -84,8 +87,13 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RepresentationLimit => f.write_str("fixed-width compatibility coefficient limit"),
+            Self::RoundedAddition => f.write_str("binary64 compatibility arithmetic would round"),
+            Self::PreservedExpression => f.write_str("opaque source expression"),
             Self::NonFinite => f.write_str("angle input must be finite"),
-            Self::DivisionByZero => f.write_str("division by zero"),
+            Self::DivisionByZero => {
+                f.write_str("angle expression must be finite: division by zero")
+            }
             Self::ZeroPowerZero => f.write_str("0^0 is outside the supported real domain"),
             Self::InvalidDomain(fun) => {
                 write!(f, "argument is outside {}'s real domain", fun.name())
@@ -282,6 +290,20 @@ impl Angle {
     pub const ONE: Self = Self(Value::Rational { n: 1, d: 1 });
     pub const PI: Self = Self(Value::Pi { n: 1, d: 1 });
 
+    #[inline]
+    pub(crate) fn phase_quarters(k: u8) -> Self {
+        match k & 7 {
+            0 => Self::ZERO,
+            1 => Self(Value::Pi { n: 1, d: 4 }),
+            2 => Self(Value::Pi { n: 1, d: 2 }),
+            3 => Self(Value::Pi { n: 3, d: 4 }),
+            4 => Self::PI,
+            5 => Self(Value::Pi { n: 5, d: 4 }),
+            6 => Self(Value::Pi { n: 3, d: 2 }),
+            7 => Self(Value::Pi { n: 7, d: 4 }),
+            _ => unreachable!(),
+        }
+    }
     /// Exact meaning of a supplied binary64 value; no pi inference or rounding.
     /// This constructor allocates nothing, including for subnormal values.
     #[inline]
@@ -312,6 +334,70 @@ impl Angle {
             },
             _ => None,
         }
+    }
+    /// A numeric SDK parameter only when it equals this literal scalar exactly.
+    pub fn to_f64_exact(&self) -> Option<f64> {
+        use num_traits::ToPrimitive;
+        if let Value::Dyadic(bits) = self.0 {
+            return Some(f64::from_bits(bits));
+        }
+        let r = self.as_rational()?;
+        let value = r.to_big_rational().to_f64()?;
+        if value.is_finite() && Rational::from_bits(value.to_bits()) == r {
+            Some(value)
+        } else {
+            None
+        }
+    }
+    /// Exact coefficients `(pi, rational)` when the scalar is affine in pi.
+    /// This classification never evaluates functions or narrows coefficients.
+    pub fn affine_coefficients(&self) -> Option<(Rational, Rational)> {
+        if let Some(r) = self.as_rational() {
+            return Some((Rational::ZERO, r));
+        }
+        if let Some(p) = self.pi_coefficient() {
+            return Some((p, Rational::ZERO));
+        }
+        let NodeKind::Sum(terms) = self.kind()? else {
+            return None;
+        };
+        let mut p = Rational::ZERO;
+        let mut r = Rational::ZERO;
+        for term in terms {
+            if term.atom == Self::PI {
+                p = term.coefficient.clone();
+            } else if term.atom == Self::ONE {
+                r = term.coefficient.clone();
+            } else {
+                return None;
+            }
+        }
+        Some((p, r))
+    }
+    pub(crate) fn affine_parts(&self) -> Option<(Self, Self)> {
+        let NodeKind::Sum(terms) = self.kind()? else {
+            return None;
+        };
+        if terms.len() != 2 {
+            return None;
+        }
+        let mut p = None;
+        let mut r = None;
+        for term in terms {
+            if term.atom == Self::PI {
+                p = Some(&term.coefficient);
+            } else if term.atom == Self::ONE {
+                r = Some(&term.coefficient);
+            } else {
+                return None;
+            }
+        }
+        let mut ctx = AngleContext::default();
+        let mut budget = Budget::default();
+        Some((
+            ctx.number(p?.clone(), true, &mut budget).ok()?,
+            ctx.number(r?.clone(), false, &mut budget).ok()?,
+        ))
     }
     pub fn pi_coefficient(&self) -> Option<Rational> {
         match &self.0 {
@@ -347,9 +433,20 @@ impl Angle {
         match &self.0 {
             Value::Rational { n: 0, .. } => Some(0),
             Value::Pi { n, d } => {
-                let n = *n as i64 * 4;
-                let d = *d as i64;
-                (n % d == 0).then(|| (n / d).rem_euclid(period.quarters() as i64) as u8)
+                let quarters = match *d {
+                    1 => *n as i64 * 4,
+                    2 => *n as i64 * 2,
+                    4 => *n as i64,
+                    _ => {
+                        let n = *n as i64 * 4;
+                        let d = *d as i64;
+                        if n % d != 0 {
+                            return None;
+                        }
+                        n / d
+                    }
+                };
+                Some((quarters as u64 & (period.quarters() as u64 - 1)) as u8)
             }
             Value::Shared(node) => match &node.kind {
                 NodeKind::Pi(r) => r.turns(period.quarters()),
@@ -617,3 +714,6 @@ mod tests;
 
 #[cfg(test)]
 mod regression_tests;
+
+#[cfg(test)]
+mod pass_tests;

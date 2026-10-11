@@ -5,6 +5,20 @@ This branch implements the accepted-angle policy in
 The release version remains unchanged; this is a Rust source compatibility
 change to schedule for the next API release.
 
+## Current symbolic implementation
+
+The historical accepted-angle implementation below has been superseded by the
+[symbolic integration](symbolic-angle-core.md#pass-integration). Every native
+angle parameter now stores the same exact symbolic `Angle`. Scalar equality is
+literal; rotation periods are explicit and controlled RX/RY/RZ retain `4*pi`.
+Decimal QASM is exact rather than binary64 evaluation. Arithmetic promotes
+coefficients instead of refusing representational overflow. Unsupported proof
+queries and resource failures preserve gates; there is no implicit numeric input
+fallback or opaque source representation. SDK float imports retain exact dyadics,
+and certified synthesis encloses complete symbolic expressions.
+
+The remaining sections document the earlier policy and its original motivation.
+
 ## Inputs and public API
 
 `Gate::rz` takes an immutable checked `Angle`. Replace numeric construction

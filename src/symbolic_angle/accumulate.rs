@@ -61,6 +61,7 @@ impl PhaseAccumulator {
         angle: &Angle,
         negative: bool,
     ) -> Result<(), Error> {
+        ctx.charge_run(&[angle])?;
         self.budget.value(angle)?;
         if let Some(k) = angle.quarter_turns(self.period) {
             return self.add_quarters(if negative { -(k as i64) } else { k as i64 });

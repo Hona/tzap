@@ -5,46 +5,28 @@ tzap. Keep arithmetic and optimization exact; evaluate expressions numerically
 only at explicit synthesis, numeric export, or diagnostic boundaries. Preserve
 the speed of the common Clifford+T and finite numeric input paths.
 
-Preparatory integration adapters are implemented; circuit storage and passes
-still use the legacy angle. The baseline is main at `f29e728`, merged into
-`codex/symbolic-angle`, plus the standalone core and performance work in
-`163aa1b` and `016cf02`. The remaining stages below are proposed work.
+## Implementation status
 
-Step 1 now provides gate semantics and lowering with an explicit scalar global
-phase, exact legacy affine conversion, a borrowed internal expression view, and
-a bounded sparse phase accumulator. Regression fixtures cover all eight native
-angle families, synthesis, SDK export, and serial and parallel optimization.
-See [the core documentation](symbolic-angle-core.md#integration-adapters) for API
-contracts and [the measured baseline](symbolic-angle-integration-baseline.md).
+The scalar storage switch and pass migration are implemented on
+`codex/symbolic-angle`, based on main at `f29e728`. Circuit fields alias the
+symbolic type; native parsing is exact; SDK imports preserve binary64 values;
+per-pipeline and per-worker contexts enforce resource limits. Cancellation and
+phase folding use gate-aware proof queries, and `CnotMin` uses sparse general
+accumulation with rollback. Certified synthesis evaluates full expressions with
+outward integer intervals and independently verifies ordinary and controlled
+operators. The existing per-input binary64 epsilon contract remains in place.
 
-## Existing implementation
+Independent formal phase tests, arbitrary-precision rational references, exact
+controlled-gate matrices, allocation checks and Python SDK equivalence tests
+cover this migration. [The benchmark record](symbolic-angle-integration-baseline.md)
+separates the preparatory measurements from the integrated implementation.
 
-The [symbolic core](symbolic-angle-core.md) already supplies exact rationals,
-mathematical pi, exact binary64 inputs, bounded expression arithmetic, six scalar
-functions, proof queries, parsing, and a context-local weak interner. Values own
-immutable storage and survive their contexts. Small values occupy 16 bytes on the
-measured ARM64 target. There are 37 core tests and a separate allocation test.
-
-The circuit still uses `angle::Angle`: a finite binary64 residual plus a bounded
-rational pi coefficient, or a preserved source expression. Its public equality
-and hashing reduce pi coefficients modulo `2*pi`. Pi-free QASM expressions use
-binary64 evaluation; non-affine pi expressions can fall back to numeric input.
-
-Main now provides certified synthesis in `src/synthesis.rs`. It encloses accepted
-affine angles with integer interval arithmetic, supplies a high precision target
-directly to gridsynth, and independently verifies proposed words. Controlled
-rotations receive verification of the complete operator. Reports sum per-input
-gate error bounds outward. Numeric SDK export preserves mixed angles through
-exact named-gate expansion where available and rejects unsupported symbolic
-conversions. Retain these guarantees during migration. The older
-[angle migration notes](angle-soundness-migration.md) describe an earlier synthesis
-boundary and should be updated when integration ships.
-
-The remaining foundations are expression-wide certified evaluation, explicit
-gate semantics, efficient accumulation across many gates, and context ownership
-through the optimization pipeline. Arbitrary precision means exact symbolic
-storage with explicit resource limits; it does not promise unlimited computation
-or a numerical answer to every proof query.
+The detailed design below remains the roadmap. Whole-circuit epsilon allocation,
+an exact epsilon API, broader symbolic proof rules, and a fallible whole-circuit
+serialization budget are follow-up extensions. General random/Pauli folds use
+bounded canonical merging; sparse accumulation is currently used by `CnotMin`.
+Source syntax and per-expression limits remain enforced, and callers can bound
+individual text output with `Angle::to_expression_string`.
 
 ## Scalar and gate semantics
 

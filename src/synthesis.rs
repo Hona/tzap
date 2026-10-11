@@ -1,7 +1,7 @@
 //! Certified synthesis of accepted angles. The dependency proposes a word;
 //! independent integer interval arithmetic decides whether it is acceptable.
 mod exact_word;
-mod interval;
+pub(crate) mod interval;
 use crate::angle::Angle;
 use crate::circuit::Gate;
 use dashu_float::{FBig, round::mode::HalfEven};
@@ -68,16 +68,9 @@ fn prepare_scaled_with_period(
     period: i64,
     scale: Scale,
 ) -> Result<Target, Failure> {
-    let (pi_coefficient, residual) = angle
-        .components()
-        .ok_or("preserved angle expression cannot be synthesized")?;
     let ctx = Context::new(bits);
     let pi = ctx.pi();
-    let coefficient = BigInt::from(pi_coefficient.numerator());
-    let theta = pi
-        .scale(&coefficient)
-        .div_int(pi_coefficient.denominator() as u64)
-        .add(&ctx.float(residual.get()));
+    let theta = crate::symbolic_angle::evaluate::enclose(angle, &ctx).map_err(Failure::Interval)?;
     let theta = match scale {
         Scale::Whole => theta,
         Scale::Half => theta.div_int(2),
@@ -134,10 +127,11 @@ pub(crate) fn verify_controlled(input: &Gate, gates: &[Gate], epsilon: f64) -> R
         } => (theta, *control, *target),
         _ => return Err("expected a controlled rotation".into()),
     };
-    let (_, residual) = angle.components().ok_or("preserved controlled angle")?;
-    let exponent = ((residual.get().to_bits() >> 52) & 2047) as usize;
     let accuracy = (-epsilon.min(1.0).log2()).ceil() as usize;
-    let bits = exponent.saturating_sub(1022).max(64) + accuracy + 128;
+    let bits = angle
+        .coefficient_bits()
+        .max(64)
+        .saturating_add(accuracy + 128);
     let prepared = prepare_with_period(angle, bits.min(MAX_BITS), 4)?;
     let ctx = &prepared.ctx;
     let mut expected = two_identity(ctx);
@@ -288,17 +282,30 @@ pub(crate) fn synthesize_scaled(
     ) {
         return Ok(word.clone());
     }
-    let (_, residual) = angle
-        .components()
-        .ok_or("preserved angle expression cannot be synthesized")?;
-    let exponent = ((residual.get().to_bits() >> 52) & 2047) as usize;
-    let magnitude_bits = exponent.saturating_sub(1022).max(64);
     let accuracy_bits = (-epsilon.min(1.0).log2()).ceil() as usize;
-    let bits = magnitude_bits + accuracy_bits + 128;
+    let mut bits = angle
+        .coefficient_bits()
+        .max(64)
+        .saturating_add(accuracy_bits + 128);
     if bits > MAX_BITS {
         return Err(Failure::Limit("certification precision limit reached"));
     }
-    let target = prepare_scaled_with_period(angle, bits, 2, scale)?;
+    let target = loop {
+        match prepare_scaled_with_period(angle, bits, 2, scale) {
+            Ok(target)
+                if target.reduced.hi.clone() - &target.reduced.lo
+                    <= target.ctx.float(epsilon / 16.0).lo =>
+            {
+                break target;
+            }
+            _ if bits < MAX_BITS => bits = (bits * 2).min(MAX_BITS),
+            _ => {
+                return Err(Failure::Interval(
+                    "symbolic target could not be enclosed within the precision budget",
+                ));
+            }
+        }
+    };
     let budget = target.ctx.float(epsilon.min(1.0));
     // Tiny rotations may be proved close to I without calling the synthesizer.
     if interval::verifies(&target.matrix, &[], &target.pi, &budget, &target.ctx)

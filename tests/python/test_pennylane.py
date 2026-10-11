@@ -174,7 +174,7 @@ def test_native_qasm_bridge_uses_expected_gate_names():
     assert "x q[0];" in qasm
     assert "sdg q[0];" in qasm
     assert "tdg q[0];" in qasm
-    assert "rz(-0.25) q[0];" in qasm
+    assert "rz((-1/4)) q[0];" in qasm
     assert "cx q[0],q[1];" in qasm
     assert "ccz q[0],q[1],q[2];" in qasm
 

@@ -196,7 +196,14 @@ fn tiny_hadamard_rotation_is_preserved_by_each_exact_pass() {
 #[test]
 fn exact_scaled_targets_enclose_unrepresentable_halves() {
     let tiny = Angle::from_f64(f64::from_bits(1)).unwrap();
-    assert!(tiny.checked_half().is_err());
+    assert_eq!(
+        tiny.checked_half()
+            .unwrap()
+            .as_rational()
+            .unwrap()
+            .to_big_rational(),
+        BigRational::new(1.into(), BigInt::from(1) << 1075usize)
+    );
     let bits = 1200;
     let target = prepare_scaled_with_period(&tiny, bits, 2, Scale::Half).unwrap();
     let expected = BigRational::new(1.into(), BigInt::from(1) << 1075usize);
@@ -206,7 +213,15 @@ fn exact_scaled_targets_enclose_unrepresentable_halves() {
     assert!(rational_endpoint(&negative.reduced.lo, &negative.ctx) <= -expected.clone());
     assert!(rational_endpoint(&negative.reduced.hi, &negative.ctx) >= -expected);
     let fraction = Angle::pi_fraction(1, i64::MAX).unwrap();
-    assert!(fraction.checked_half().is_err());
+    assert_eq!(
+        fraction
+            .checked_half()
+            .unwrap()
+            .pi_coefficient()
+            .unwrap()
+            .to_big_rational(),
+        BigRational::new(1.into(), BigInt::from(i64::MAX) * 2)
+    );
     let target = prepare_scaled_with_period(&fraction, 512, 2, Scale::Half).unwrap();
     let pi = target.ctx.pi();
     let denominator = BigInt::from(i64::MAX) * 2;

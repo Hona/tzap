@@ -1,4 +1,4 @@
-//! Preparatory gate adapters. Circuit storage and passes still use the legacy angle.
+//! Gate-aware symbolic adapters with explicit scalar global phases.
 use super::{Angle, AngleContext, Error, Proof, RotationPeriod};
 use crate::circuit::{Gate, Qubit};
 use smallvec::SmallVec;
@@ -184,22 +184,12 @@ impl std::fmt::Display for IntegrationError {
 }
 impl std::error::Error for IntegrationError {}
 
-/// Preserve the accepted literal pi coefficient and exact binary64 residual.
-/// Opaque source expressions are never reparsed under an implicit input policy.
+/// Compatibility adapter: validate the now-identical scalar type in this context.
 pub fn from_legacy(
     ctx: &mut AngleContext,
     legacy: &crate::angle::Angle,
 ) -> Result<Angle, IntegrationError> {
-    let (pi, residual) = legacy.components().ok_or(IntegrationError::OpaqueLegacy)?;
-    let residual = ctx.from_f64(residual.get())?;
-    if pi.numerator() == 0 {
-        return Ok(residual);
-    }
-    let pi = ctx.pi_fraction(pi.numerator(), pi.denominator())?;
-    if residual.prove_zero() == Proof::Proven {
-        return Ok(pi);
-    }
-    Ok(ctx.add(&pi, &residual)?)
+    Ok(ctx.add(legacy, &Angle::ZERO)?)
 }
 
 fn phase_word(gates: &mut SmallVec<[Gate; 12]>, k: u8, q: Qubit) {
