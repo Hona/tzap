@@ -140,6 +140,7 @@ tzap supports a subset of OpenQASM 2.0:
 
 1. **Fuzzing and equivalence verification** on small random circuits and benchmark circuits.
 2. **Lean port:** the core optimizer is implemented and proven sound in Lean 4 — see [`lean/`](lean/).
+3. **Symbolic arithmetic:** angles use exact symbolic arithmetic without floating-point rounding; numerical approximation is used when interfacing with gridsynth.
 
 The new native gate families and generalized rotation synthesis are currently
 implemented in Rust and Python; the Lean gate model has not been extended.

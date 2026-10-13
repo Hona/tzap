@@ -283,7 +283,7 @@ the folds across H. It handles every gate kind (see the guide), and also runs
 independently on the original circuit. The CLI equivalent for the combined
 pipeline is `--passes CancelGates,PhaseFoldRand,PhaseFoldPauli`. Axis equality is exact;
 random fingerprints only locate possible matches, and intervening commutation
-is checked exactly. Arbitrary Rz angles use floating-point addition. Rz angles
+is checked exactly. Arbitrary Rz angles use exact symbolic addition. Rz angles
 close to a Clifford+T angle are not rounded to it. See
 [the implementation guide](docs/phase-fold-pauli.md).
 
