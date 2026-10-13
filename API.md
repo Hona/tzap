@@ -122,10 +122,30 @@ lowers both `ccx` and `ccz` to Clifford+T.
 
 Expressions may span lines. Native QASM serialization retains complete exact
 expressions, including mixed pi and rational values. Resource and domain failures
-produce explicit errors. Custom gate definitions and free parameters remain
-outside the supported subset. `qasm::serialize_sdk` performs exact numeric export;
+produce explicit errors. Unbound free parameters remain outside the supported subset. Custom formals
+are resolved and bound during inlining. `qasm::serialize_sdk` performs exact numeric export;
 `serialize_numeric_lossy` explicitly permits approximation and counts each
 uncertified conversion.
+
+Custom `gate` definitions are fully inlined into existing `Gate` variants before
+optimization. Parameterized bodies can call earlier definitions using scoped
+formal parameters and qubits. All unitary calls support whole-register
+broadcasting. `U`, `CX`, `u1`, `u2`, `u3`, and `id` lower to the existing basis;
+serialization emits flat QASM without definitions. No `Circuit` fields change.
+
+`tzap::qasm::parse_with_limits(source, ParseLimits)` exposes expansion budgets.
+Defaults are custom call depth 256, expression nesting 256, ten million emitted
+operations from custom calls or native register broadcasts, and twenty million
+work units. Each call visit, bound qubit, bound parameter, and expression
+opcode consumes one unit; cached constant expressions cost one unit instead.
+These calls share budgets; even identity broadcasts consume work. Alias checks
+run once before broadcasting rather than per lane. Explicit indexed native
+statements are not capped. Checks and fallible
+reservation happen before implicit expansion. Angles use exact symbolic
+arithmetic; parameter binding does not reduce angles modulo a period. The parser
+rejects recursion, forward references, conflicting names, nonunitary bodies,
+barriers inside bodies, and unsupported includes or expressions. Errors contain
+statement line numbers and a bounded call trace for parameter evaluation failures.
 
 ## Optimizing
 

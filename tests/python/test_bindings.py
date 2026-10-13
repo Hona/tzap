@@ -31,6 +31,29 @@ QASM = make_qasm(
 )
 
 
+def test_custom_gates_inline_and_optimize_across_calls():
+    source = make_qasm(
+        """
+        gate pulse(theta) a { rz(theta/2) a; }
+        gate double(theta) a { pulse(theta) a; pulse(theta) a; }
+        double(pi/2) q;
+        """,
+        qubits=2,
+    )
+    result = tzap.optimize_qasm(source, passes=["CancelGates"])
+    assert result.report.input.gates == 4
+    assert "gate " not in result.qasm
+    assert "double" not in result.qasm
+    assert "qreg q[2];" in result.qasm
+
+
+def test_custom_gate_parameter_failure_raises_qasm_error_with_call_trace():
+    source = make_qasm("gate g(theta) a { rz(1/theta) a; } g(0) q[0];")
+    with pytest.raises(tzap.QasmError, match="division by zero") as exc:
+        tzap.optimize_qasm(source, passes=["CancelGates"])
+    assert "called 'g'" in str(exc.value)
+
+
 def test_optimize_qasm_returns_qasm_and_metrics():
     result = tzap.optimize_qasm(QASM, level="O1")
 

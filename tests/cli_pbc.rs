@@ -210,7 +210,7 @@ fn unsupported_inputs_fail_even_without_output_destination() {
         ),
         (
             "h q[1];\ncx q[0],q[0];",
-            "line 6: cx expects distinct qubit operands, qubit 0 is repeated",
+            "line 6: cx requires distinct qubit operands",
         ),
     ] {
         let run = Tzap::new(&["-", "--to-pbc", "--passes", "CancelGates"])
@@ -579,7 +579,7 @@ fn pbc_input_is_checked_before_optimization() {
         .failed("repeated operand");
     assert!(
         run.stderr
-            .contains("line 7: cx expects distinct qubit operands, qubit 1 is repeated"),
+            .contains("line 7: cx requires distinct qubit operands"),
         "{}",
         run.stderr
     );
