@@ -210,7 +210,7 @@ fn unsupported_inputs_fail_even_without_output_destination() {
         ),
         (
             "h q[1];\ncx q[0],q[0];",
-            "gate 2 (cnot q0, q0): a gate's qubits must be distinct",
+            "cx requires distinct qubit operands",
         ),
     ] {
         let run = Tzap::new(&["-", "--to-pbc", "--passes", "CancelGates"])
@@ -578,8 +578,7 @@ fn pbc_input_is_checked_before_optimization() {
         .run()
         .failed("repeated operand");
     assert!(
-        run.stderr
-            .contains("gate 3 (cnot q1, q1): a gate's qubits must be distinct"),
+        run.stderr.contains("cx requires distinct qubit operands"),
         "{}",
         run.stderr
     );
