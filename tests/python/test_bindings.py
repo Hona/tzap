@@ -77,6 +77,7 @@ def test_public_version_is_semver_and_matches_native_module():
 def test_public_all_exports_resolve():
     expected = {
         "Metrics",
+        "NumericalReport",
         "OptimizationError",
         "OptimizationReport",
         "OptimizationResult",
@@ -170,6 +171,7 @@ def test_passes_accept_a_one_shot_generator():
         "CancelGates",
         "SuperOpt",
         "PhaseFoldRand",
+        "PhaseFoldPauli",
         "CnotMin",
     ],
 )
@@ -242,6 +244,20 @@ def test_decompose_rz_removes_all_rz_gates():
     assert "rz(" not in result.qasm
 
 
+@pytest.mark.parametrize("option", ["decompose_rotations", "decompose_rz"])
+def test_rotation_options_lower_all_axes(option):
+    circuit = make_qasm("rx(-0.73) q[0]; ry(1.39) q[0]; rz(0.37) q[0];")
+    result = tzap.optimize_qasm(circuit, level="O1", rz_epsilon=1e-3, **{option: True})
+    assert not any(axis + "(" in result.qasm for axis in ("rz", "rx", "ry"))
+
+
+@pytest.mark.parametrize("pass_name", ["DecomposeRotations", "DecomposeRz"])
+def test_rotation_pass_names_lower_all_axes(pass_name):
+    circuit = make_qasm("rx(-0.73) q[0]; ry(1.39) q[0]; rz(0.37) q[0];")
+    result = tzap.optimize_qasm(circuit, passes=[pass_name], rz_epsilon=1e-3)
+    assert not any(axis + "(" in result.qasm for axis in ("rz", "rx", "ry"))
+
+
 def test_custom_pipeline_fixpoint_is_accepted():
     circuit = make_qasm("h q[0]; x q[0]; h q[0]; z q[0];")
 
@@ -311,18 +327,19 @@ def test_comments_and_angle_expressions_are_accepted():
     result = tzap.optimize_qasm(circuit, passes=["CancelGates"])
 
     assert result.report.input.rz == 1
-    assert "rz(" in result.qasm
+    assert "s q[0];" in result.qasm
+    assert result.report.output.rz == 0
 
 
 def test_invalid_qasm_raises_specific_exception():
     with pytest.raises(tzap.QasmError, match="unsupported"):
-        tzap.optimize_qasm("OPENQASM 2.0; qreg q[1]; y q[0];", level="O1")
+        tzap.optimize_qasm("OPENQASM 2.0; qreg q[1]; unknown q[0];", level="O1")
 
 
 @pytest.mark.parametrize(
     ("source", "message"),
     [
-        ("OPENQASM 2.0; qreg q[1]; y q[0];", "unsupported"),
+        ("OPENQASM 2.0; qreg q[1]; unknown q[0];", "unsupported"),
         ("OPENQASM 2.0; qreg q[1]; h q[2];", "out of range"),
         ("OPENQASM 2.0; qreg q[1]; cx q[0];", "expects 2"),
         ("OPENQASM 2.0; qreg q[1]; rz() q[0];", "angle"),
@@ -395,3 +412,34 @@ def test_non_string_qasm_is_rejected_by_binding_type_check():
 def test_non_string_pass_item_is_rejected_by_binding_type_check():
     with pytest.raises(TypeError):
         tzap.optimize_qasm(QASM, passes=["CancelGates", 123])
+
+
+def test_numerical_contract_and_exact_large_coefficient():
+    source = make_qasm("rz(pi/9223372036854775808) q[0];")
+    result = tzap.optimize_qasm(source, level="O1")
+    assert "(1/9223372036854775808)*pi" in result.qasm
+    assert result.report.numerical.preserved_expressions == 0
+    assert result.report.numerical.input_policy == "exact_symbolic"
+    assert result.report.numerical.randomized_matching
+
+
+def test_no_float_pi_inference_or_rounded_folding():
+    source = make_qasm("rz(1e16) q[0]; rz(1) q[0]; rz(-1e16) q[0];")
+    result = tzap.optimize_qasm(source, passes=["PhaseFoldRand"])
+    assert result.report.output.rz == 1
+    assert result.report.numerical.skipped_rounded_folds == 0
+    result = tzap.optimize_qasm(make_qasm(f"rz({math.pi / 4!r}) q[0];"), level="O1")
+    assert result.report.output.rz == 1
+    assert result.report.output.t == 0
+
+
+def test_explicit_synthesis_reports_certified_accepted_angle_error():
+    result = tzap.optimize_qasm(
+        make_qasm("rz(pi/7) q[0];"), passes=["DecomposeRz"], rz_epsilon=1e-5
+    )
+    assert result.report.numerical.uncertified_syntheses == 0
+    assert result.report.numerical.certified_syntheses == 1
+    assert result.report.numerical.certified_error_bound >= 1e-5
+    assert (
+        "accepted_angle_per_input_gate" in result.report.numerical.synthesis_error_scope
+    )

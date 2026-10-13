@@ -1,11 +1,12 @@
+use crate::angle::Angle;
 use std::collections::hash_map::RandomState;
-use std::f64::consts::PI;
 use std::hash::{BuildHasher, Hasher};
 
 use rustc_hash::FxHashMap;
 
+use crate::angle::AngleContext;
 use crate::circuit::{Circuit, Gate, Qubit};
-use crate::pass::Pass;
+use crate::pass::{Pass, PassState};
 
 /// A random evaluation of a Boolean polynomial in GF(2^128), together with
 /// an upper bound on its total degree. Addition is XOR; multiplication is
@@ -55,18 +56,12 @@ fn field_mul(mut left: u128, mut right: u128) -> u128 {
     product
 }
 
-/// Accumulated phase for one Boolean-polynomial fingerprint group.
-/// `int_part` counts π/4 steps mod 8 (Clifford+T gates land here exclusively).
-/// `float_part` holds leftover rotation for rz gates whose angle is not a π/4 multiple.
-/// Pure Clifford+T circuits only ever touch `int_part`.
 struct LivePhase {
-    int_part: u8,
+    angle: Angle,
     qubit: Qubit,
     current_idx: usize,
-    float_part: f64,
-    /// True when `current_idx` sits on the complement of the group's canonical value.
-    /// On emission, the accumulated rotation is negated to compensate.
     current_sign: bool,
+    input_gates: usize,
 }
 
 /// Merges T/Rz gates that act on the same Boolean polynomial using random
@@ -84,17 +79,23 @@ impl Pass for PhaseFoldRand {
     fn run(&self, circuit: &Circuit) -> Circuit {
         phase_fold_rand(circuit)
     }
+    fn run_with_state(&self, circuit: &Circuit, state: &mut PassState) -> Circuit {
+        phase_fold_rand_with_context(circuit, &mut state.angles)
+    }
 }
 
 /// Free-function form of [`PhaseFoldRand`], for use outside a [`Pass`] pipeline.
 pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
+    phase_fold_rand_with_context(circuit, &mut PassState::default().angles)
+}
+fn phase_fold_rand_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Circuit {
     let n = circuit.num_qubits;
     let mut qubits: Vec<Fingerprint> = (0..n).map(|_| fresh_fingerprint()).collect();
 
     let mut live: Vec<LivePhase> = Vec::new();
     let mut fingerprint_to_group: FxHashMap<u128, usize> = FxHashMap::default();
     let mut skip = vec![false; circuit.gates.len()];
-    let mut emit_at: Vec<Option<(Qubit, u8, f64)>> = vec![None; circuit.gates.len()];
+    let mut emit_at: Vec<Option<(Qubit, Angle)>> = vec![None; circuit.gates.len()];
 
     for (idx, gate) in circuit.gates.iter().enumerate() {
         match gate {
@@ -106,6 +107,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::tdg(q) => record_int(
                 &qubits,
@@ -115,6 +117,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::s(q) => record_int(
                 &qubits,
@@ -124,6 +127,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::sdg(q) => record_int(
                 &qubits,
@@ -133,6 +137,7 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
             Gate::z(q) => record_int(
                 &qubits,
@@ -142,27 +147,38 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
                 &mut live,
                 &mut fingerprint_to_group,
                 &mut skip,
+                ctx,
             ),
-            Gate::rz(theta, q) => match classify_quarter_pi(*theta) {
-                Some(k) => record_int(
-                    &qubits,
-                    *q,
-                    k,
-                    idx,
-                    &mut live,
-                    &mut fingerprint_to_group,
-                    &mut skip,
-                ),
-                None => record_float(
-                    &qubits,
-                    *q,
-                    *theta,
-                    idx,
-                    &mut live,
-                    &mut fingerprint_to_group,
-                    &mut skip,
-                ),
-            },
+            Gate::rz(theta, q) => record_angle(
+                &qubits,
+                *q,
+                theta.clone(),
+                idx,
+                &mut live,
+                &mut fingerprint_to_group,
+                &mut skip,
+                ctx,
+            ),
+            Gate::p(..)
+            | Gate::y(_)
+            | Gate::sx(_)
+            | Gate::rx(..)
+            | Gate::ry(..)
+            | Gate::swap(..)
+            | Gate::cy { .. }
+            | Gate::cp { .. }
+            | Gate::crx { .. }
+            | Gate::cry { .. }
+            | Gate::crz { .. }
+            | Gate::ch { .. }
+            | Gate::cswap { .. } => {
+                // Native transfer rules are separate work. End the current
+                // phase-analysis region and retain this operation verbatim.
+                fingerprint_to_group.clear();
+                for value in &mut qubits {
+                    *value = fresh_fingerprint();
+                }
+            }
             Gate::h(q) => {
                 qubits[*q as usize] = fresh_fingerprint();
             }
@@ -217,40 +233,26 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
         }
     }
 
-    // Finalize: emit surviving groups or skip if angle cancelled to zero.
     for lp in &live {
-        let (int_part, float_part) = if lp.current_sign {
-            // Last seen location is on ¬canonical — negate to compensate.
-            (8u8.wrapping_sub(lp.int_part) & 7, -lp.float_part)
+        let angle = lp.angle.clone();
+        if lp.input_gates == 1 && angle.emitted_gate_count() > 1 {
+            continue;
+        }
+        if angle.projective_identity() {
+            skip[lp.current_idx] = true;
         } else {
-            (lp.int_part, lp.float_part)
-        };
-
-        if float_part == 0.0 {
-            // Pure integer group — no float math.
-            if int_part == 0 {
-                skip[lp.current_idx] = true;
-            } else {
-                emit_at[lp.current_idx] = Some((lp.qubit, int_part, 0.0));
-            }
-        } else {
-            let total = (int_part as f64) * (PI / 4.0) + float_part;
-            if angle_is_zero(total) {
-                skip[lp.current_idx] = true;
-            } else {
-                emit_at[lp.current_idx] = Some((lp.qubit, 0, total));
-            }
+            emit_at[lp.current_idx] = Some((lp.qubit, angle));
         }
     }
 
     // Reconstruct circuit, moving gates to avoid per-gate clones.
-    let mut output = Circuit::with_cbits(n, circuit.num_cbits);
+    let mut output = circuit.empty_like();
     for (idx, gate) in circuit.gates.clone().into_iter().enumerate() {
         if skip[idx] {
             continue;
         }
-        if let Some((qubit, int_part, float_part)) = emit_at[idx] {
-            emit_rotation(&mut output, qubit, int_part, float_part);
+        if let Some((qubit, angle)) = &emit_at[idx] {
+            angle.emit(&mut output, *qubit);
         } else {
             output.apply(gate);
         }
@@ -259,164 +261,96 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_int(
     qubits: &[Fingerprint],
     q: Qubit,
     k: u8,
     idx: usize,
     live: &mut Vec<LivePhase>,
-    fingerprint_to_group: &mut FxHashMap<u128, usize>,
+    groups: &mut FxHashMap<u128, usize>,
     skip: &mut [bool],
+    ctx: &mut AngleContext,
 ) {
-    let value = qubits[q as usize].value;
-    if value == 0 || value == FIELD_ONE {
-        // A rotation conditioned on a known |0⟩ is the identity; on a known
-        // |1⟩ it contributes only a global phase. Neither needs to be emitted.
-        skip[idx] = true;
-        return;
-    }
-    let (key, is_complement) = canonical_fingerprint(value);
-
-    if let Some(&gi) = fingerprint_to_group.get(&key) {
-        skip[live[gi].current_idx] = true;
-        if is_complement {
-            // RZ(θ) on ¬p ≡ RZ(−θ) on p up to global phase.
-            live[gi].int_part = live[gi].int_part.wrapping_sub(k) & 7;
-        } else {
-            live[gi].int_part = (live[gi].int_part + k) & 7;
-        }
-        live[gi].current_idx = idx;
-        live[gi].qubit = q;
-        live[gi].current_sign = is_complement;
-        return;
-    }
-
-    let int_part = if is_complement {
-        8u8.wrapping_sub(k) & 7
-    } else {
-        k
-    };
-    let gi = live.len();
-    live.push(LivePhase {
-        int_part,
-        float_part: 0.0,
-        current_idx: idx,
-        qubit: q,
-        current_sign: is_complement,
-    });
-    fingerprint_to_group.insert(key, gi);
+    record_angle(qubits, q, Angle::turns(k), idx, live, groups, skip, ctx);
 }
-
-fn record_float(
+#[allow(clippy::too_many_arguments)]
+fn record_angle(
     qubits: &[Fingerprint],
     q: Qubit,
-    theta: f64,
+    angle: Angle,
     idx: usize,
     live: &mut Vec<LivePhase>,
-    fingerprint_to_group: &mut FxHashMap<u128, usize>,
+    groups: &mut FxHashMap<u128, usize>,
     skip: &mut [bool],
+    ctx: &mut AngleContext,
 ) {
     let value = qubits[q as usize].value;
     if value == 0 || value == FIELD_ONE {
-        // See record_int: rotations on known computational-basis constants are
-        // observationally irrelevant.
         skip[idx] = true;
         return;
     }
-    let (key, is_complement) = canonical_fingerprint(value);
-
-    if let Some(&gi) = fingerprint_to_group.get(&key) {
-        skip[live[gi].current_idx] = true;
-        if is_complement {
-            live[gi].float_part -= theta;
+    let (key, complement) = canonical_fingerprint(value);
+    if let Some(&gi) = groups.get(&key) {
+        let sign = if live[gi].current_sign == complement {
+            1
         } else {
-            live[gi].float_part += theta;
+            -1
+        };
+        if let Ok(merged) = live[gi].angle.merge_phases_with(ctx, sign, &angle)
+            && merged.emitted_gate_count() <= live[gi].input_gates + 1
+        {
+            skip[live[gi].current_idx] = true;
+            live[gi].angle = merged;
+            live[gi].current_idx = idx;
+            live[gi].qubit = q;
+            live[gi].current_sign = complement;
+            live[gi].input_gates += 1;
+            return;
         }
-        live[gi].current_idx = idx;
-        live[gi].qubit = q;
-        live[gi].current_sign = is_complement;
-        return;
+        // Leave the earlier group live for finalization and start a new one.
     }
-
-    let float_part = if is_complement { -theta } else { theta };
     let gi = live.len();
     live.push(LivePhase {
-        int_part: 0,
-        float_part,
-        current_idx: idx,
+        angle,
         qubit: q,
-        current_sign: is_complement,
+        current_idx: idx,
+        current_sign: complement,
+        input_gates: 1,
     });
-    fingerprint_to_group.insert(key, gi);
-}
-
-/// Returns Some(k) if theta ≈ k · π/4 (mod 2π) within 1e-9, else None.
-pub(crate) fn classify_quarter_pi(theta: f64) -> Option<u8> {
-    let n = theta.rem_euclid(2.0 * PI);
-    let q = PI / 4.0;
-    let k = (n / q).round();
-    if (n - k * q).abs() < 1e-9 {
-        Some((k as u32 & 7) as u8)
-    } else {
-        None
-    }
-}
-
-fn angle_is_zero(angle: f64) -> bool {
-    let n = angle.rem_euclid(2.0 * PI);
-    n < 1e-6 || (2.0 * PI - n) < 1e-6
-}
-
-fn emit_rotation(output: &mut Circuit, q: Qubit, int_part: u8, float_part: f64) {
-    if float_part == 0.0 {
-        emit_int(output, q, int_part);
-    } else {
-        let theta = (int_part as f64) * (PI / 4.0) + float_part;
-        emit_float(output, q, theta);
-    }
-}
-
-fn emit_int(output: &mut Circuit, q: Qubit, k: u8) {
-    match k & 7 {
-        0 => {}
-        1 => output.apply(Gate::t(q)),
-        2 => output.apply(Gate::s(q)),
-        3 => {
-            output.apply(Gate::s(q));
-            output.apply(Gate::t(q));
-        }
-        4 => output.apply(Gate::z(q)),
-        5 => {
-            output.apply(Gate::z(q));
-            output.apply(Gate::t(q));
-        }
-        6 => output.apply(Gate::sdg(q)),
-        7 => output.apply(Gate::tdg(q)),
-        _ => unreachable!(),
-    }
-}
-
-fn emit_float(output: &mut Circuit, q: Qubit, angle: f64) {
-    let n = angle.rem_euclid(2.0 * PI);
-    if angle_is_zero(n) {
-        return;
-    }
-    let quarter = PI / 4.0;
-    let k = (n / quarter).round();
-    // Use 1e-6 tolerance to handle floating-point drift from summing many π/4 multiples.
-    if (n - k * quarter).abs() < 1e-6 {
-        emit_int(output, q, (k as u32 & 7) as u8);
-    } else {
-        output.apply(Gate::rz(n, q));
-    }
+    groups.insert(key, gi);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::angle::AngleContext;
     use crate::decompose::DecomposeToffoli;
     use crate::pass::Pass;
     use crate::unitary::circuits_equiv;
+
+    #[test]
+    fn forced_sketch_collision_exposes_separate_probabilistic_matching_contract() {
+        // Equal sketches are not a proof of equal Boolean functions. This
+        // controlled collision documents why numerical exactness alone is
+        // not an unconditional correctness guarantee for this pass.
+        let qubits = [Fingerprint {
+            value: 2,
+            degree: 1,
+        }; 2];
+        let mut live = Vec::new();
+        let mut groups = FxHashMap::default();
+        let mut skip = [false; 2];
+        let ctx = &mut AngleContext::default();
+        record_int(&qubits, 0, 1, 0, &mut live, &mut groups, &mut skip, ctx);
+        record_int(&qubits, 1, 1, 1, &mut live, &mut groups, &mut skip, ctx);
+        assert!(skip[0]);
+        let mut input = Circuit::new(2);
+        input.gates = vec![Gate::t(0), Gate::t(1)];
+        let mut output = Circuit::new(2);
+        live[0].angle.emit(&mut output, live[0].qubit);
+        assert!(!circuits_equiv(&input, &output, 1e-12));
+    }
 
     fn count_gates(c: &Circuit) -> usize {
         c.gates.len()
@@ -1715,9 +1649,9 @@ mod tests {
     #[test]
     fn rz_folds_across_x() {
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(0.3, 0));
+        c.apply(Gate::rz_f64(0.3, 0).unwrap());
         c.apply(Gate::x(0));
-        c.apply(Gate::rz(0.7, 0));
+        c.apply(Gate::rz_f64(0.7, 0).unwrap());
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(circuits_equiv(&c, &opt, 1e-10));
@@ -1727,9 +1661,9 @@ mod tests {
     fn rz_cancels_across_x() {
         // RZ(θ); X; RZ(θ) = RZ(θ)·RZ(−θ)·X = X up to global phase.
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(0.42, 0));
+        c.apply(Gate::rz_f64(0.42, 0).unwrap());
         c.apply(Gate::x(0));
-        c.apply(Gate::rz(0.42, 0));
+        c.apply(Gate::rz_f64(0.42, 0).unwrap());
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 0);
         assert!(circuits_equiv(&c, &opt, 1e-10));
@@ -1770,9 +1704,9 @@ mod tests {
         let mut c = Circuit::new(1);
         c.apply(Gate::t(0));
         c.apply(Gate::x(0));
-        c.apply(Gate::rz(0.5, 0));
+        c.apply(Gate::rz_f64(0.5, 0).unwrap());
         let opt = phase_fold_rand(&c);
-        assert_eq!(count_phase_gates(&opt), 1);
+        assert_eq!(count_phase_gates(&opt), 2);
         assert!(circuits_equiv(&c, &opt, 1e-10));
     }
 
@@ -1948,8 +1882,8 @@ mod tests {
     #[test]
     fn rz_merge() {
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(0.3, 0));
-        c.apply(Gate::rz(0.7, 0));
+        c.apply(Gate::rz_f64(0.25, 0).unwrap());
+        c.apply(Gate::rz_f64(0.75, 0).unwrap());
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(circuits_equiv(&c, &opt, 1e-10));
@@ -2014,7 +1948,7 @@ mod tests {
             control: 1,
             target: 2,
         });
-        c.apply(Gate::rz(0.5, 2));
+        c.apply(Gate::rz_f64(0.5, 2).unwrap());
         c.apply(Gate::cnot {
             control: 1,
             target: 2,
@@ -2031,7 +1965,7 @@ mod tests {
             control: 0,
             target: 2,
         });
-        c.apply(Gate::rz(0.5, 2));
+        c.apply(Gate::rz_f64(0.5, 2).unwrap());
 
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
@@ -2045,7 +1979,7 @@ mod tests {
             control: 0,
             target: 1,
         });
-        c.apply(Gate::rz(0.3, 1));
+        c.apply(Gate::rz_f64(0.25, 1).unwrap());
         c.apply(Gate::cnot {
             control: 0,
             target: 1,
@@ -2054,7 +1988,7 @@ mod tests {
             control: 1,
             target: 0,
         });
-        c.apply(Gate::rz(0.7, 0));
+        c.apply(Gate::rz_f64(0.75, 0).unwrap());
 
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
@@ -2224,7 +2158,7 @@ mod tests {
             control: 1,
             target: 2,
         });
-        c3.apply(Gate::rz(0.5, 2));
+        c3.apply(Gate::rz_f64(0.5, 2).unwrap());
         c3.apply(Gate::cnot {
             control: 1,
             target: 2,
@@ -2241,7 +2175,7 @@ mod tests {
             control: 0,
             target: 2,
         });
-        c3.apply(Gate::rz(0.5, 2));
+        c3.apply(Gate::rz_f64(0.5, 2).unwrap());
         let opt3 = phase_fold_rand(&c3);
         print_before_after("3-qubit merge (Rz on q2 twice, same parity)", &c3, &opt3);
 
@@ -2250,7 +2184,7 @@ mod tests {
             control: 0,
             target: 1,
         });
-        c4.apply(Gate::rz(0.3, 1));
+        c4.apply(Gate::rz_f64(0.3, 1).unwrap());
         c4.apply(Gate::cnot {
             control: 0,
             target: 1,
@@ -2259,7 +2193,7 @@ mod tests {
             control: 1,
             target: 0,
         });
-        c4.apply(Gate::rz(0.7, 0));
+        c4.apply(Gate::rz_f64(0.7, 0).unwrap());
         let opt4 = phase_fold_rand(&c4);
         print_before_after("Rz(0.3) on q1 + Rz(0.7) on q0 -> Rz(1.0)", &c4, &opt4);
     }
@@ -2737,7 +2671,7 @@ mod tests {
     #[test]
     fn rz_pi_folds_to_z() {
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(PI, 0));
+        c.apply(Gate::rz(crate::angle_expr::parse("pi", 1).unwrap(), 0));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::z(_)));
@@ -2747,7 +2681,10 @@ mod tests {
     #[test]
     fn rz_neg_half_pi_folds_to_sdg() {
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(-PI / 2.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("-pi / 2.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::sdg(_)));
@@ -2757,7 +2694,10 @@ mod tests {
     #[test]
     fn rz_three_half_pi_folds_to_sdg() {
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(3.0 * PI / 2.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("3.0 * pi / 2.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::sdg(_)));
@@ -2807,17 +2747,19 @@ mod tests {
         assert!(circuits_equiv(&c, &result, 1e-10));
     }
 
-    // --- mixed int + float (π/4-multiple) accumulation tests ---
-    // These exercise the interaction between int_part (T/Tdg/S/Sdg/Z) and
-    // rz(·) gates, both when the rz angle is a π/4 multiple (int_part path)
-    // and when it is arbitrary (float_part path).
+    // --- exact pi coefficients and finite residual accumulation tests ---
+    // Named phases and explicitly symbolic Rz share exact quarter turns.
+    // Numeric residuals remain separate when emitting the combined angle.
 
     #[test]
     fn t_plus_rz_quarter_pi_is_s() {
         // T (π/4) + rz(π/4) → 2·π/4 = S
         let mut c = Circuit::new(1);
         c.apply(Gate::t(0));
-        c.apply(Gate::rz(PI / 4.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 4.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::s(_)));
@@ -2829,7 +2771,10 @@ mod tests {
         // S (π/2) + rz(π/2) → π = Z
         let mut c = Circuit::new(1);
         c.apply(Gate::s(0));
-        c.apply(Gate::rz(PI / 2.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 2.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::z(_)));
@@ -2840,7 +2785,7 @@ mod tests {
     fn rz_pi_plus_tdg_is_z_plus_t() {
         // rz(π) (4) + Tdg (7) → 11 & 7 = 3 → S + T
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(PI, 0));
+        c.apply(Gate::rz(crate::angle_expr::parse("pi", 1).unwrap(), 0));
         c.apply(Gate::tdg(0));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 2); // S + T
@@ -2853,7 +2798,10 @@ mod tests {
         let mut c = Circuit::new(1);
         c.apply(Gate::t(0));
         c.apply(Gate::tdg(0));
-        c.apply(Gate::rz(PI / 4.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 4.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::t(_)));
@@ -2862,43 +2810,40 @@ mod tests {
 
     #[test]
     fn t_plus_rz_irrational_folds() {
-        // T (π/4) + rz(0.3) — float_part nonzero, should emit an rz with
-        // the combined angle π/4 + 0.3 (not a π/4 multiple).
+        // Preserve the exact T and numeric residual as separate operations.
         let mut c = Circuit::new(1);
         c.apply(Gate::t(0));
-        c.apply(Gate::rz(0.3, 0));
+        c.apply(Gate::rz_f64(0.3, 0).unwrap());
         let opt = phase_fold_rand(&c);
-        assert_eq!(count_phase_gates(&opt), 1);
-        match &opt.gates[0] {
-            Gate::rz(theta, _) => {
-                let expected = (PI / 4.0 + 0.3).rem_euclid(2.0 * PI);
-                assert!((theta - expected).abs() < 1e-9);
-            }
-            g => panic!("expected rz, got {g:?}"),
-        }
+        assert_eq!(count_phase_gates(&opt), 2);
+        assert!(opt.gates.iter().any(|g| matches!(g, Gate::t(0))));
+        assert!(
+            opt.gates
+                .iter()
+                .any(|g| matches!(g, Gate::rz(a, 0) if a.components().unwrap().1.get() == 0.3))
+        );
         assert!(circuits_equiv(&c, &opt, 1e-10));
     }
 
     #[test]
-    fn t_rz_irrational_cancels_to_zero_after_second_rz() {
-        // T + rz(-π/4) — float_part(-π/4) doesn't match π/4-multiple at
-        // classify time (0.7853... may differ from negated). Check that
-        // the integer and float parts combine correctly to cancel.
+    fn t_plus_negative_exact_quarter_cancels() {
+        // Explicit pi provenance proves this cancellation without a tolerance.
         let mut c = Circuit::new(1);
         c.apply(Gate::t(0));
-        c.apply(Gate::rz(-PI / 4.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("-pi / 4.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
-        // Either cancels entirely (both routed to int_part) or emits a
-        // near-identity rz; equivalence check is authoritative.
         assert!(circuits_equiv(&c, &opt, 1e-10));
-        assert!(count_phase_gates(&opt) <= 1);
+        assert!(opt.gates.is_empty());
     }
 
     #[test]
     fn mixed_int_float_across_cnot() {
         // Route parity X (q0's initial) onto q1 via two cnots, so a rz(0.3)
         // on q1 merges with an earlier T on q0 (same fingerprint group → one
-        // LivePhase with int_part=1, float_part=0.3).
+        // LivePhase with an exact quarter turn and a numeric residual).
         let mut c = Circuit::new(2);
         c.apply(Gate::t(0)); // parity X, int=1
         c.apply(Gate::cnot {
@@ -2909,14 +2854,14 @@ mod tests {
             control: 0,
             target: 1,
         }); // q1 = Y^(X^Y) = X
-        c.apply(Gate::rz(0.3, 1)); // parity X → merge
+        c.apply(Gate::rz_f64(0.3, 1).unwrap()); // parity X → merge
         let opt = phase_fold_rand(&c);
-        assert_eq!(count_phase_gates(&opt), 1);
+        assert_eq!(count_phase_gates(&opt), 2);
         match opt.gates.iter().find(|g| matches!(g, Gate::rz(..))) {
             Some(Gate::rz(theta, _)) => {
-                let expected = (PI / 4.0 + 0.3).rem_euclid(2.0 * PI);
+                let expected = 0.3;
                 assert!(
-                    (theta - expected).abs() < 1e-9,
+                    (theta.to_f64_lossy().unwrap() - expected).abs() < 1e-9,
                     "theta={theta}, expected={expected}"
                 );
             }
@@ -2927,11 +2872,17 @@ mod tests {
 
     #[test]
     fn s_plus_two_rz_quarter_pi_cancel_to_z() {
-        // S (2) + rz(π/4) (1) + rz(π/4) (1) → 4 = Z (all in int_part)
+        // S (2) + rz(π/4) (1) + rz(π/4) (1) → 4 = Z exactly.
         let mut c = Circuit::new(1);
         c.apply(Gate::s(0));
-        c.apply(Gate::rz(PI / 4.0, 0));
-        c.apply(Gate::rz(PI / 4.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 4.0", 1).unwrap(),
+            0,
+        ));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 4.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::z(_)));
@@ -2940,11 +2891,11 @@ mod tests {
 
     #[test]
     fn t_rz_irrational_rz_opposite_irrational_leaves_t() {
-        // T + rz(0.3) + rz(-0.3) → T (float_part cancels, int_part stays)
+        // T + rz(0.3) + rz(-0.3) → T (the residual cancels exactly).
         let mut c = Circuit::new(1);
         c.apply(Gate::t(0));
-        c.apply(Gate::rz(0.3, 0));
-        c.apply(Gate::rz(-0.3, 0));
+        c.apply(Gate::rz_f64(0.3, 0).unwrap());
+        c.apply(Gate::rz_f64(-0.3, 0).unwrap());
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(circuits_equiv(&c, &opt, 1e-10));
@@ -2956,7 +2907,7 @@ mod tests {
         let mut c = Circuit::new(1);
         c.apply(Gate::s(0));
         c.apply(Gate::t(0));
-        c.apply(Gate::rz(PI, 0));
+        c.apply(Gate::rz(crate::angle_expr::parse("pi", 1).unwrap(), 0));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 1);
         assert!(matches!(&opt.gates[0], Gate::tdg(_)));
@@ -2969,7 +2920,10 @@ mod tests {
         let mut c = Circuit::new(1);
         c.apply(Gate::sdg(0));
         c.apply(Gate::t(0));
-        c.apply(Gate::rz(PI / 4.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 4.0", 1).unwrap(),
+            0,
+        ));
         let opt = phase_fold_rand(&c);
         assert_eq!(count_phase_gates(&opt), 0);
         assert!(circuits_equiv(&c, &opt, 1e-10));
@@ -3091,7 +3045,7 @@ mod tests {
         c.apply(Gate::t(0));
         c.apply(Gate::s(0));
         c.apply(Gate::z(0));
-        c.apply(Gate::rz(0.123, 0));
+        c.apply(Gate::rz_f64(0.123, 0).unwrap());
         let opt = phase_fold_rand(&c);
         assert!(matches!(opt.gates.as_slice(), [Gate::reset(0)]));
     }
@@ -3234,12 +3188,12 @@ mod tests {
     #[test]
     fn arbitrary_rz_folds_through_cz() {
         let mut c = Circuit::new(2);
-        c.apply(Gate::rz(0.37, 1));
+        c.apply(Gate::rz_f64(0.37, 1).unwrap());
         c.apply(Gate::cz {
             control: 1,
             target: 0,
         });
-        c.apply(Gate::rz(-0.12, 1));
+        c.apply(Gate::rz_f64(-0.12, 1).unwrap());
         let opt = phase_fold_rand(&c);
         assert_eq!(opt.gates.len(), 2);
         assert!(matches!(
@@ -3249,8 +3203,8 @@ mod tests {
                 target: 0
             }
         ));
-        match opt.gates[1] {
-            Gate::rz(theta, 1) => assert!((theta - 0.25).abs() < 1e-12),
+        match &opt.gates[1] {
+            Gate::rz(theta, 1) => assert!((theta.to_f64_lossy().unwrap() - 0.25).abs() < 1e-12),
             ref other => panic!("expected merged Rz, got {other:?}"),
         }
         assert!(circuits_equiv(&c, &opt, 1e-10));

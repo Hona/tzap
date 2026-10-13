@@ -1,5 +1,5 @@
 use super::{
-    Operands, ParseLimits,
+    Evaluation, Operands,
     definitions::{self, Callable, Registry},
 };
 use crate::circuit::Gate;
@@ -145,14 +145,15 @@ pub(super) fn call(
     line: usize,
     registry: &Registry,
     registers: &[(String, usize, usize)],
-    limits: ParseLimits,
+    evaluation: Evaluation<'_>,
     budget: &mut Budget,
     gates: &mut Vec<Gate>,
 ) -> Result<(), String> {
+    let Evaluation { limits, angles } = evaluation;
     let (name, params, qubits) = definitions::call_parts(source, line)?;
     let callee = registry.lookup(name, line)?;
-    let expressions = definitions::expressions(params, &[], limits, line)?;
-    let parameters = definitions::evaluate(&expressions, &[], line)?;
+    let expressions = definitions::expressions(params, &[], limits, line, angles)?;
+    let parameters = definitions::evaluate(&expressions, &[], line, angles)?;
     let args: SmallVec<[Operand; 3]> = definitions::comma_list(qubits)
         .map(|s| operand(s, registers, line, false))
         .collect::<Result<_, _>>()?;
@@ -216,9 +217,15 @@ pub(super) fn call(
         let qubits: Operands = args.iter().map(|a| a.at(lane)).collect();
         match callee {
             Callable::Native(n) => n.emit(&parameters, &qubits, gates),
-            Callable::Custom(id) => {
-                definitions::expand(registry, id, parameters.clone(), qubits, line, gates)?
-            }
+            Callable::Custom(id) => definitions::expand(
+                registry,
+                id,
+                parameters.clone(),
+                qubits,
+                line,
+                gates,
+                angles,
+            )?,
         }
     }
     Ok(())

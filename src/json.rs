@@ -312,7 +312,14 @@ fn options_value(options: &Options, run: &RunInfo<'_>) -> Value {
             }),
         ),
         ("fixpoint", Value::Bool(options.fixpoint)),
-        ("decompose_rz", Value::Bool(options.decompose_rz)),
+        (
+            "decompose_rotations",
+            Value::Bool(options.decompose_rotations_enabled()),
+        ),
+        (
+            "decompose_rz",
+            Value::Bool(options.decompose_rotations_enabled()),
+        ),
         ("decompose_cz", Value::Bool(options.decompose_cz)),
         ("decompose_ccx", Value::Bool(options.decompose_ccx)),
         ("rz_epsilon", Value::Float(options.rz_epsilon)),
@@ -381,6 +388,57 @@ pub(crate) fn render(
             ]),
         ),
         ("options", options_value(options, run)),
+        (
+            "numerical",
+            Value::Object(vec![
+                ("input_policy", Value::str("exact_symbolic")),
+                ("folding", Value::str("no_added_rounding")),
+                (
+                    "preserved_expressions",
+                    Value::Int(report.numerical.preserved_expressions),
+                ),
+                (
+                    "numerical_fallbacks",
+                    Value::Int(report.numerical.numerical_fallbacks),
+                ),
+                (
+                    "skipped_rounded_folds",
+                    Value::Int(report.numerical.skipped_rounded_folds),
+                ),
+                (
+                    "skipped_nonfinite_folds",
+                    Value::Int(report.numerical.skipped_nonfinite_folds),
+                ),
+                (
+                    "skipped_coefficient_limit_folds",
+                    Value::Int(report.numerical.skipped_coefficient_limit_folds),
+                ),
+                (
+                    "randomized_matching",
+                    Value::Bool(report.numerical.randomized_matching),
+                ),
+                (
+                    "uncertified_syntheses",
+                    Value::Int(report.numerical.uncertified_syntheses),
+                ),
+                (
+                    "certified_syntheses",
+                    Value::Int(report.numerical.certified_syntheses),
+                ),
+                (
+                    "failed_certifications",
+                    Value::Int(report.numerical.failed_certifications),
+                ),
+                (
+                    "certified_error_bound",
+                    Value::some(report.numerical.certified_error_bound, Value::Float),
+                ),
+                (
+                    "synthesis_error_scope",
+                    Value::str("accepted_angle_per_input_gate; summed_bound_covers_synthesis_only"),
+                ),
+            ]),
+        ),
         (
             "metrics",
             Value::Object(vec![

@@ -425,7 +425,11 @@ fn reject_bad_initial_stores_operands_and_resource_limits() {
         );
     }
     assert_eq!(
-        circuit_channel(&circuit(1, 0, vec![Gate::rz(0.1, 0)]), &[], limits),
+        circuit_channel(
+            &circuit(1, 0, vec![Gate::rz_f64(0.1, 0).unwrap()]),
+            &[],
+            limits
+        ),
         Err(Error::UnsupportedOperation { index: 0 })
     );
     let huge = circuit(usize::MAX, 0, vec![]);
@@ -453,15 +457,16 @@ fn zero_qubit_empty_channels_preserve_classical_state() {
 }
 
 #[test]
-fn resets_are_rejected_and_post_measurement_gates_are_supported() {
+fn resets_and_post_measurement_gates_are_supported() {
     let limits = ChannelLimits::default();
-    for gates in [vec![Gate::reset(0)], vec![Gate::h(0), Gate::reset(0)]] {
-        let index = gates.len() - 1;
-        assert_eq!(
-            circuit_channel(&circuit(1, 0, gates), &[], limits),
-            Err(Error::UnsupportedOperation { index })
-        );
-    }
+    let reset = circuit_channel(&circuit(1, 0, vec![Gate::reset(0)]), &[], limits).unwrap();
+    let h_reset = circuit_channel(
+        &circuit(1, 0, vec![Gate::h(0), Gate::reset(0)]),
+        &[],
+        limits,
+    )
+    .unwrap();
+    reset.compare(&h_reset).unwrap(); // Both overwrite arbitrary input with |0>.
     // Gates after a measurement act on each post-measurement branch.
     for gate in [Gate::h(0), Gate::x(0), Gate::t(0), Gate::sdg(0)] {
         let c = circuit(1, 1, vec![measure(0, 0), gate]);
@@ -616,4 +621,172 @@ fn unitary_channels_agree_with_unitary_matrices() {
         }],
     );
     assert_eq!(check(&c, &[]).compare(&expected), Ok(()));
+}
+
+#[test]
+fn certified_rz_folders_preserve_exact_channels_through_measurement_and_reset() {
+    use crate::{
+        angle::Angle, cancel::CancelGates, cnot_min::CnotMin, pass::Pass,
+        phase_fold_pauli::PhaseFoldPauli, phase_fold_rand::PhaseFoldRand,
+    };
+    let rotation = |n, d, q| Gate::rz(Angle::pi_fraction(n, d).unwrap(), q);
+    let cases = [
+        circuit(
+            2,
+            1,
+            vec![
+                Gate::h(0),
+                rotation(1, 4, 0),
+                measure(0, 0),
+                Gate::x(0),
+                rotation(1, 4, 0),
+                Gate::h(1),
+            ],
+        ),
+        circuit(
+            2,
+            1,
+            vec![
+                Gate::h(0),
+                cx(0, 1),
+                rotation(1, 4, 0),
+                Gate::reset(0),
+                rotation(1, 4, 0),
+                rotation(1, 4, 1),
+                measure(1, 0),
+            ],
+        ),
+        circuit(
+            2,
+            1,
+            vec![
+                rotation(1, 4, 0),
+                Gate::h(0),
+                rotation(1, 2, 1),
+                measure(1, 0),
+                Gate::h(0),
+                rotation(1, 4, 0),
+                Gate::reset(1),
+            ],
+        ),
+    ];
+    for input in cases {
+        let before = gate_channel(&input, &[false]);
+        for pass in [
+            &CancelGates as &dyn Pass,
+            &PhaseFoldRand,
+            &PhaseFoldPauli,
+            &CnotMin::default(),
+        ] {
+            let output = pass.run(&input);
+            before
+                .compare(&gate_channel(&output, &[false]))
+                .unwrap_or_else(|e| panic!("{}: {e:?}", pass.name()));
+        }
+    }
+}
+
+#[test]
+fn native_fixed_gates_preserve_exact_channels_around_measurements() {
+    let cx = |control, target| Gate::cnot { control, target };
+    for (gate, expansion) in [
+        (Gate::y(0), vec![Gate::sdg(0), Gate::x(0), Gate::s(0)]),
+        (Gate::sx(1), vec![Gate::h(1), Gate::s(1), Gate::h(1)]),
+        (Gate::swap(1, 0), vec![cx(1, 0), cx(0, 1), cx(1, 0)]),
+    ] {
+        for before in [false, true] {
+            let mut prefix = vec![Gate::h(0), cx(0, 1), Gate::t(1)];
+            if before {
+                prefix.push(measure(0, 0));
+            }
+            let mut native = prefix.clone();
+            let mut expanded = prefix;
+            native.push(gate.clone());
+            expanded.extend(expansion.clone());
+            native.push(measure(1, 0));
+            expanded.push(measure(1, 0));
+            for initial in [false, true] {
+                let actual = gate_channel(&circuit(2, 1, native.clone()), &[initial]);
+                assert_eq!(
+                    actual,
+                    gate_channel(&circuit(2, 1, expanded.clone()), &[initial])
+                );
+                assert_trace_preserving(&actual);
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_controlled_gates_preserve_exact_channels_with_measurement() {
+    let cy = Gate::cy {
+        control: 0,
+        target: 1,
+    };
+    let cx = Gate::cnot {
+        control: 0,
+        target: 1,
+    };
+    let ch = Gate::ch {
+        control: 0,
+        target: 1,
+    };
+    let ch_terms = vec![
+        Gate::cz {
+            control: 0,
+            target: 1,
+        },
+        Gate::sdg(1),
+        Gate::h(1),
+        Gate::t(1),
+        Gate::h(1),
+        Gate::s(1),
+        cx.clone(),
+        Gate::sdg(1),
+        Gate::h(1),
+        Gate::tdg(1),
+        Gate::h(1),
+        Gate::s(1),
+        cx.clone(),
+    ];
+    let swap_cx = Gate::cnot {
+        control: 1,
+        target: 2,
+    };
+    for (gate, terms) in [
+        (cy, vec![Gate::sdg(1), cx, Gate::s(1)]),
+        (ch, ch_terms),
+        (
+            Gate::cswap {
+                control: 0,
+                first: 1,
+                second: 2,
+            },
+            vec![
+                swap_cx.clone(),
+                Gate::ccx {
+                    control1: 0,
+                    control2: 2,
+                    target: 1,
+                },
+                swap_cx,
+            ],
+        ),
+    ] {
+        for before in [false, true] {
+            let mut prefix = vec![Gate::h(0), Gate::h(1), Gate::t(2)];
+            if before {
+                prefix.push(measure(0, 0));
+            }
+            let mut native = prefix.clone();
+            native.push(gate.clone());
+            native.push(measure(1, 0));
+            let mut expanded = prefix;
+            expanded.extend(terms.clone());
+            expanded.push(measure(1, 0));
+            let actual = gate_channel(&circuit(3, 1, native), &[false]);
+            assert_eq!(actual, gate_channel(&circuit(3, 1, expanded), &[false]));
+            assert_trace_preserving(&actual);
+        }
+    }
 }

@@ -28,6 +28,15 @@ To use `measure` gates, allocate classical bits with
 | T | `Gate::t(qubit)` |
 | Tdg | `Gate::tdg(qubit)` |
 | Rz | `Gate::rz(angle, qubit)` |
+| Phase | `Gate::p(angle, qubit)` |
+| Y | `Gate::y(qubit)` |
+| Square root of X | `Gate::sx(qubit)` |
+| Rx, Ry | `Gate::rx(angle, qubit)`, `Gate::ry(angle, qubit)` |
+| SWAP | `Gate::swap(first, second)` |
+| CY, CH | `Gate::cy { control, target }`, `Gate::ch { control, target }` |
+| CP | `Gate::cp { lambda, control, target }` |
+| CRX, CRY, CRZ | `Gate::crx { theta, control, target }` (likewise `cry`, `crz`) |
+| CSWAP | `Gate::cswap { control, first, second }` |
 | CNOT | `Gate::cnot { control, target }` |
 | CZ | `Gate::cz { control, target }` |
 | Toffoli | `Gate::ccx { control1, control2, target }` |
@@ -35,11 +44,56 @@ To use `measure` gates, allocate classical bits with
 | Measure | `Gate::measure { qubit, cbit }` |
 | Reset | `Gate::reset(qubit)` |
 
-Operands are `Qubit` and `CBit`, both aliases for `u32` — a `Gate` is 16
-bytes, which matters on circuits of tens of millions of gates. Integer
-literals still work unannotated; a `usize` index needs `as u32`.
+Operands are `Qubit` and `CBit`, both aliases for `u32`. Integer literals
+still work unannotated; a `usize` index needs `as u32`.
+
+All parameterized gates take a checked `Angle`, rather than an `f64`. This is a Rust
+source compatibility change. Explicit fractions retain mathematical pi;
+numeric inputs retain their exact finite binary64 value. `angle::Angle` and
+`symbolic_angle::Angle` are the same type:
+
+```rust
+use tzap::{angle::Angle, circuit::Gate};
+let symbolic = Gate::rz(Angle::pi_fraction(1, 7)?, 0);
+let numeric = Gate::rz_f64(0.3, 0)?;
+assert!(Gate::rz_f64(f64::NAN, 0).is_err());
+# Ok::<(), tzap::angle::AngleError>(())
+```
+
+`Gate::p_f64`, `Gate::rx_f64`, and `Gate::ry_f64` provide the same checked
+numeric construction as `Gate::rz_f64`. `Gate::angle()` borrows a parameter
+without changing it. Controlled gate equality compares literal parameters:
+CRX/CRY/CRZ at 2π retain their control-branch phase.
+
+A numeric `PI/4` is not inferred to be an exact pi fraction. Default folding
+never adds rounding, snaps a small rotation to zero, or wraps a float modulo
+a floating approximation to pi. Arithmetic promotes to arbitrary-precision
+coefficients when needed. A resource limit or unproved rewrite leaves the affected
+gates intact. Named T/S/Z gates retain exact discrete arithmetic. See
+[the migration notes](docs/angle-soundness-migration.md).
+
+Use `AngleContext` to construct general expressions, for example
+`ctx.parse("sin(pi/7) + sqrt(2)/3")?`. All eight parameterized gate families
+store these expressions directly. Equality and hashing compare literal scalars;
+`0`, `2*pi`, and `4*pi` are distinct. Gate-aware proof queries supply a rotation
+period explicitly. Controlled RX/RY/RZ use `4*pi` to retain relative phases.
+
+Each optimization pipeline owns an arithmetic context; parallel workers own
+independent contexts. `Pass::run_with_state` accepts a `PassState` for shared
+interning and configurable `Limits`. Values survive that context's destruction.
+See [the symbolic core](docs/symbolic-angle-core.md).
 
 ### QASM I/O
+
+QASM decimal literals and expressions are exact: `0.1+0.2` means `3/10`.
+`sin`, `cos`, `tan`, `exp`, `ln`, `sqrt`, and integer powers remain symbolic.
+Serialization preserves exact scalar expressions. `parse_numeric_sdk` explicitly
+interprets finite numeric literals as binary64 inputs; Qiskit and PennyLane
+imports instead encode their existing float parameters as exact rational text.
+Safe SDK export emits exact named phases and sums of binary64 parameters when
+possible, and rejects unsupported conversions. Explicit lossy export records
+uncertified conversions. Certified rotation synthesis encloses the whole
+expression before independently verifying the resulting gate word.
 
 Parse from and convert to OpenQASM 2.0. `from_qasm` returns
 `Result<Circuit, String>`:
@@ -58,8 +112,20 @@ let circuit = Circuit::from_qasm("
 let qasm_string = circuit.to_qasm();
 ```
 
+The parser accepts every gate above, including `u1` for P and `cu1` for CP.
+Serialization emits those QASM 2 aliases and expands SX, SWAP, and CSWAP
+exactly. CRX and CRY serialize as basis changes around CRZ, retaining the
+original checked angle without half-angle rounding.
+
 The QASM parser accepts `ccz` as a native circuit gate. `DecomposeToffoli`
 lowers both `ccx` and `ccz` to Clifford+T.
+
+Expressions may span lines. Native QASM serialization retains complete exact
+expressions, including mixed pi and rational values. Resource and domain failures
+produce explicit errors. Unbound free parameters remain outside the supported subset. Custom formals
+are resolved and bound during inlining. `qasm::serialize_sdk` performs exact numeric export;
+`serialize_numeric_lossy` explicitly permits approximation and counts each
+uncertified conversion.
 
 Custom `gate` definitions are fully inlined into existing `Gate` variants before
 optimization. Parameterized bodies can call earlier definitions using scoped
@@ -75,7 +141,7 @@ opcode consumes one unit; cached constant expressions cost one unit instead.
 These calls share budgets; even identity broadcasts consume work. Alias checks
 run once before broadcasting rather than per lane. Explicit indexed native
 statements are not capped. Checks and fallible
-reservation happen before implicit expansion. Angles use finite `f64`
+reservation happen before implicit expansion. Angles use exact symbolic
 arithmetic; parameter binding does not reduce angles modulo a period. The parser
 rejects recursion, forward references, conflicting names, nonunitary bodies,
 barriers inside bodies, and unsupported includes or expressions. Errors contain
@@ -111,10 +177,11 @@ CCX/CCZ, CZ, or Rz decomposition.
 | `level` | `Level::O3` | `O1` (cancel + phase-fold), `O2` (adds SuperOpt, 2 rounds), `O3` (same, to a fixpoint), `Osuper` (`O3` with the bigger SuperOpt bounds) |
 | `passes` | `None` | An explicit `Vec<PassName>` pipeline, replacing `level`'s |
 | `fixpoint` | `false` | Repeat until the gate count stops falling. Only consulted for pipelines that aren't already fixpoint loops (`passes`, or `O1`) |
-| `decompose_rz` | `false` | Decompose Rz into Clifford+T via gridsynth |
+| `decompose_rotations` | `false` | Decompose P, Rz/Rx/Ry, CP, and CRz/CRx/CRy into Clifford+T |
+| `decompose_rz` | `false` | Compatibility alias for `decompose_rotations` |
 | `decompose_cz` | `false` | Decompose CZ into H+CX+H before optimizing |
 | `decompose_ccx` | `false` | Decompose CCX and CCZ into Clifford+T |
-| `rz_epsilon` | `1e-10` | Approximation epsilon for `decompose_rz` |
+| `rz_epsilon` | `1e-10` | Per-input-gate certified spectral epsilon for rotation decomposition |
 | `parallel` | `false` | Optimize gate-contiguous chunks concurrently, then concatenate |
 | `superopt` | all `None` | Per-run overrides for the SuperOpt window/MURM bounds |
 | `superopt_gates` | `Auto` | Base MURM basis plus native CZ/CCX/CCZ gates present in the current stage |
@@ -122,8 +189,28 @@ CCX/CCZ, CZ, or Rz decomposition.
 `Report` carries three sets of `Metrics` (`gates`, `two_qubit`, `depth`, `t`,
 `rz`): `input` as handed in, `baseline` (the same original input comparison
 point), and `output`. Requested decompositions are opt-in middle stages:
-optimize the input circuit, decompose CCX/CCZ then CZ then Rz, and optimize
+optimize the input circuit, decompose CCX/CCZ then CZ then rotations, and optimize
 again when a decomposition changed the circuit.
+
+`Report::numerical` records resource-limited folds, randomized matching,
+certified syntheses and their outward-summed error bounds. Legacy preserved-source,
+numeric-fallback and rounded/nonfinite-fold fields remain present and are zero
+under the `exact_symbolic` input policy. `PhaseFoldRand` uses randomized Boolean
+matching with its existing collision bound, independently of exact angle arithmetic.
+
+Explicit `DecomposeRotations` requests permit approximation of complete symbolic
+input angles. An integer interval evaluator bounds target conversion and reduction;
+an independent verifier checks the resulting gate words, including full controlled
+operators. Epsilon is a positive finite binary64 per-input-gate spectral bound;
+requests below `1e-80` or beyond evaluator resource limits fail explicitly. Summed
+bounds cover synthesis error, and the existing probabilistic matching contract
+remains separate. Exact folds add no arithmetic rounding.
+`DecomposeRotations::try_run` and the optimizer return errors when certification fails; the infallible `Pass` adapter
+returns the original circuit. Exact quarter turns lower without approximation.
+
+Y, SX, SWAP, CY, CH, and CSWAP have exact input matrices for SuperOpt; its
+synthesis basis remains unchanged. PBC conversion expands supported native
+Clifford gates exactly and requires rotation synthesis for non-quarter angles.
 
 The post-decomposition MURM basis excludes every gate family requested for
 decomposition, including gates named in an explicit `superopt_gates` basis.
@@ -183,11 +270,22 @@ A custom pass only needs to supply `name` and `run`.
 |------|--------|-------------|
 | `DecomposeToffoli` | `tzap::decompose` | Breaks CCX and CCZ gates into Clifford+T |
 | `DecomposeCz` | `tzap::decompose` | Explicitly lowers CZ gates to H+CX+H |
-| `DecomposeRz` | `tzap::decompose` | Decomposes Rz gates into Clifford+T via gridsynth |
+| `DecomposeRotations` | `tzap::decompose` | Decomposes phase gates and ordinary/controlled rotations into Clifford+T |
 | `CancelGates` | `tzap::cancel` | Removes adjacent self-inverse gate pairs (HH, XX, etc.) |
 | `SuperOpt` | `tzap::super_opt` | Replaces small windows using its shared MURM |
 | `PhaseFoldRand` | `tzap::phase_fold_rand` | Merges T/Rz gates across the circuit via randomized parity tracking |
+| `PhaseFoldPauli` | `tzap::phase_fold_pauli` | Merges T/Rz rotations across Clifford gates using exact axis and commutation checks; CCX/CCZ block the folds they anticommute with, measurements and resets are barriers |
 | `CnotMin` | `tzap::cnot_min` | Re-synthesizes CNOT-dihedral blocks to cut two-qubit gates |
+
+Every optimization level runs `PhaseFoldPauli` right after `PhaseFoldRand`:
+`PhaseFoldRand` also merges S, S† and Z phases, and `PhaseFoldPauli` then finds
+the folds across H. It handles every gate kind (see the guide), and also runs
+independently on the original circuit. The CLI equivalent for the combined
+pipeline is `--passes CancelGates,PhaseFoldRand,PhaseFoldPauli`. Axis equality is exact;
+random fingerprints only locate possible matches, and intervening commutation
+is checked exactly. Arbitrary Rz angles use floating-point addition. Rz angles
+close to a Clifford+T angle are not rounded to it. See
+[the implementation guide](docs/phase-fold-pauli.md).
 
 ### Running passes
 
@@ -311,13 +409,23 @@ anchors new windows only near what changed since the previous `run` call,
 which is unsound if the instance ever sees unrelated circuits or concurrent
 chunks, so don't share an incremental instance across parallel workers.
 
-### DecomposeRz epsilon
+### DecomposeRotations epsilon
 
 Control the approximation precision with the `epsilon` field (default `1e-10`):
 
 ```rust,ignore
-use tzap::decompose::DecomposeRz;
+use tzap::decompose::DecomposeRotations;
 
-let pass = DecomposeRz { epsilon: 1e-6 };
+let pass = DecomposeRotations { epsilon: 1e-6 };
 let cliffordt = pass.run(&circuit);
 ```
+
+`DecomposeRz`, `PassName::DecomposeRz`, `--decompose-rz`, and `decompose_rz`
+remain compatibility aliases with the generalized rotation behavior.
+
+`PhaseFoldPauli` folds P/RX/RY/RZ and T/T† using signed Pauli axes and checked
+angle sums. Y, SX, CY, and SWAP update its Clifford frame. Controlled rotations,
+CH, and CSWAP end its analysis region. Numeric sums that would round or overflow
+are declined; exact pi fractions stay symbolic, including mixed symbolic and
+numeric contributions. Qiskit and PennyLane convert emitted symbolic angles to
+framework numeric parameters explicitly when rebuilding their circuits.

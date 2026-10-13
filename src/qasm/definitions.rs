@@ -1,13 +1,13 @@
 use super::{
-    Operands, ParseLimits,
+    AngleParser, Evaluation, Operands, ParseLimits,
     expr::Expr,
     scan::{Scanner, identifier, valid_name},
 };
-use crate::circuit::Gate;
+use crate::{angle::Angle, circuit::Gate};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
-pub(super) type Values = SmallVec<[f64; 3]>;
+pub(super) type Values = SmallVec<[Angle; 3]>;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Native {
@@ -24,7 +24,19 @@ pub(super) enum Native {
     Ccx,
     Ccz,
     U,
-    U1,
+    P,
+    Y,
+    Sx,
+    Rx,
+    Ry,
+    Swap,
+    Cy,
+    Ch,
+    Cp,
+    Crx,
+    Cry,
+    Crz,
+    Cswap,
     U2,
     Id,
 }
@@ -45,7 +57,19 @@ impl Native {
             "ccx" => Self::Ccx,
             "ccz" => Self::Ccz,
             "U" | "u3" => Self::U,
-            "u1" => Self::U1,
+            "p" | "u1" => Self::P,
+            "y" => Self::Y,
+            "sx" => Self::Sx,
+            "rx" => Self::Rx,
+            "ry" => Self::Ry,
+            "swap" => Self::Swap,
+            "cy" => Self::Cy,
+            "ch" => Self::Ch,
+            "cp" | "cu1" => Self::Cp,
+            "crx" => Self::Crx,
+            "cry" => Self::Cry,
+            "crz" => Self::Crz,
+            "cswap" => Self::Cswap,
             "u2" => Self::U2,
             "id" => Self::Id,
             _ => return None,
@@ -53,22 +77,23 @@ impl Native {
     }
     pub fn signature(self) -> (usize, usize) {
         match self {
-            Self::Rz | Self::U1 => (1, 1),
+            Self::Rz | Self::P | Self::Rx | Self::Ry => (1, 1),
+            Self::Cp | Self::Crx | Self::Cry | Self::Crz => (1, 2),
             Self::U => (3, 1),
             Self::U2 => (2, 1),
-            Self::Cx | Self::Cz => (0, 2),
-            Self::Ccx | Self::Ccz => (0, 3),
+            Self::Cx | Self::Cz | Self::Swap | Self::Cy | Self::Ch => (0, 2),
+            Self::Ccx | Self::Ccz | Self::Cswap => (0, 3),
             _ => (0, 1),
         }
     }
     fn emitted(self) -> usize {
         match self {
             Self::Id => 0,
-            Self::U | Self::U2 => 7,
+            Self::U | Self::U2 => 3,
             _ => 1,
         }
     }
-    pub fn emit(self, p: &[f64], q: &[u32], gates: &mut Vec<Gate>) {
+    pub fn emit(self, p: &[Angle], q: &[u32], gates: &mut Vec<Gate>) {
         let gate = match self {
             Self::H => Gate::h(q[0]),
             Self::X => Gate::x(q[0]),
@@ -77,7 +102,46 @@ impl Native {
             Self::Sdg => Gate::sdg(q[0]),
             Self::T => Gate::t(q[0]),
             Self::Tdg => Gate::tdg(q[0]),
-            Self::Rz | Self::U1 => Gate::rz(p[0], q[0]),
+            Self::Rz => Gate::rz(p[0].clone(), q[0]),
+            Self::P => Gate::p(p[0].clone(), q[0]),
+            Self::Rx => Gate::rx(p[0].clone(), q[0]),
+            Self::Ry => Gate::ry(p[0].clone(), q[0]),
+            Self::Y => Gate::y(q[0]),
+            Self::Sx => Gate::sx(q[0]),
+            Self::Swap => Gate::swap(q[0], q[1]),
+            Self::Cy => Gate::cy {
+                control: q[0],
+                target: q[1],
+            },
+            Self::Ch => Gate::ch {
+                control: q[0],
+                target: q[1],
+            },
+            Self::Cp => Gate::cp {
+                lambda: p[0].clone(),
+                control: q[0],
+                target: q[1],
+            },
+            Self::Crx => Gate::crx {
+                theta: p[0].clone(),
+                control: q[0],
+                target: q[1],
+            },
+            Self::Cry => Gate::cry {
+                theta: p[0].clone(),
+                control: q[0],
+                target: q[1],
+            },
+            Self::Crz => Gate::crz {
+                theta: p[0].clone(),
+                control: q[0],
+                target: q[1],
+            },
+            Self::Cswap => Gate::cswap {
+                control: q[0],
+                first: q[1],
+                second: q[2],
+            },
             Self::Cx => Gate::cnot {
                 control: q[0],
                 target: q[1],
@@ -99,17 +163,17 @@ impl Native {
             Self::Id => return,
             Self::U | Self::U2 => {
                 let (theta, phi, lambda) = if matches!(self, Self::U2) {
-                    (std::f64::consts::FRAC_PI_2, p[0], p[1])
+                    (
+                        Angle::pi_fraction(1, 2).expect("pi/2"),
+                        p[0].clone(),
+                        p[1].clone(),
+                    )
                 } else {
-                    (p[0], p[1], p[2])
+                    (p[0].clone(), p[1].clone(), p[2].clone())
                 };
                 gates.extend([
                     Gate::rz(lambda, q[0]),
-                    Gate::sdg(q[0]),
-                    Gate::h(q[0]),
-                    Gate::rz(theta, q[0]),
-                    Gate::h(q[0]),
-                    Gate::s(q[0]),
+                    Gate::ry(theta, q[0]),
                     Gate::rz(phi, q[0]),
                 ]);
                 return;
@@ -196,8 +260,9 @@ impl Registry {
         scanner: &mut Scanner<'_>,
         registers: &[(String, usize, usize)],
         cregisters: &[(String, usize, usize)],
-        limits: ParseLimits,
+        evaluation: Evaluation<'_>,
     ) -> Result<(), String> {
+        let Evaluation { limits, angles } = evaluation;
         let (name, param_text, operand_text) = call_parts(header, line)?;
         if !valid_name(name) {
             return Err(format!("line {line}: invalid gate name '{name}'"));
@@ -275,7 +340,7 @@ impl Registry {
                 ));
             }
             let callee = self.lookup(callee_name, statement.line)?;
-            let expressions = expressions(params, &parameters, limits, statement.line)?;
+            let expressions = expressions(params, &parameters, limits, statement.line, angles)?;
             let mut args = SmallVec::<[usize; 3]>::new();
             for operand in comma_list(operands) {
                 let i = qubits.iter().position(|q| q == operand).ok_or_else(|| {
@@ -369,6 +434,7 @@ pub(super) fn expressions(
     parameters: &[String],
     limits: ParseLimits,
     line: usize,
+    angles: &mut AngleParser,
 ) -> Result<Vec<Expr>, String> {
     let Some(s) = s else {
         return Ok(Vec::new());
@@ -388,19 +454,25 @@ pub(super) fn expressions(
                     .ok_or_else(|| format!("line {line}: unexpected ')'"))?
             }
             b',' if depth == 0 => {
-                result.push(
-                    Expr::parse(&s[start..i], parameters, limits.expression_depth)
-                        .map_err(|e| format!("line {line}: {e}"))?,
-                );
+                result.push(Expr::parse(
+                    &s[start..i],
+                    parameters,
+                    limits.expression_depth,
+                    angles,
+                    line,
+                )?);
                 start = i + 1;
             }
             _ => (),
         }
     }
-    result.push(
-        Expr::parse(&s[start..], parameters, limits.expression_depth)
-            .map_err(|e| format!("line {line}: {e}"))?,
-    );
+    result.push(Expr::parse(
+        &s[start..],
+        parameters,
+        limits.expression_depth,
+        angles,
+        line,
+    )?);
     Ok(result)
 }
 
@@ -413,7 +485,7 @@ pub(super) fn check_signature(
 ) -> Result<(), String> {
     if params != expected.0 {
         let message = if name == "rz" && params == 0 {
-            "empty angle expression; ".to_owned()
+            "empty angle expression: expected a number, pi, or function; ".to_owned()
         } else {
             String::new()
         };
@@ -449,12 +521,16 @@ pub(super) fn distinct<T: PartialEq>(args: &[T], name: &str, line: usize) -> Res
 
 pub(super) fn evaluate(
     expressions: &[Expr],
-    values: &[f64],
+    values: &[Angle],
     line: usize,
+    angles: &mut AngleParser,
 ) -> Result<Values, String> {
     expressions
         .iter()
-        .map(|e| e.evaluate(values).map_err(|e| format!("line {line}: {e}")))
+        .map(|e| {
+            e.evaluate(values, angles)
+                .map_err(|e| format!("line {line}: {e}"))
+        })
         .collect()
 }
 
@@ -474,6 +550,7 @@ pub(super) fn expand(
     qubits: Operands,
     line: usize,
     gates: &mut Vec<Gate>,
+    angles: &mut AngleParser,
 ) -> Result<(), String> {
     let mut stack = vec![Frame {
         definition: id,
@@ -489,7 +566,7 @@ pub(super) fn expand(
             continue;
         };
         frame.next += 1;
-        let p = match evaluate(&call.parameters, &frame.parameters, call.line) {
+        let p = match evaluate(&call.parameters, &frame.parameters, call.line, angles) {
             Ok(p) => p,
             Err(error) => {
                 let mut context = error;

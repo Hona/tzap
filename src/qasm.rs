@@ -1,9 +1,9 @@
 //! OpenQASM 2.0 parser and serializer.
 //!
-//! Supports `h`, `x`, `z`, `s`, `sdg`, `t`, `tdg`, `rz`, `cx`, `ccx`, `ccz`,
-//! `cz`, `U`, `CX`, `u1`, `u2`, `u3`, `id`, measurement, reset, and registers.
+//! Supports native Clifford+T, phase, axis/controlled rotations, SWAP/CSWAP,
+//! CX/CZ/CCX/CCZ, U/u2/u3/id lowering, measurement, reset, and registers.
 //! Custom `gate` definitions are fully inlined; unitary calls support register
-//! broadcasting. Parameters use finite f64 arithmetic with scoped formals.
+//! broadcasting. Parameters use exact symbolic scalars with scoped formals.
 //! Classical conditionals, opaque gates, barriers in gate bodies, and includes
 //! other than `qelib1.inc` are rejected. Top-level barriers are ignored.
 
@@ -45,6 +45,11 @@ impl Default for ParseLimits {
 
 type Operands = SmallVec<[Qubit; 3]>;
 
+struct Evaluation<'a> {
+    limits: ParseLimits,
+    angles: &'a mut AngleParser,
+}
+
 /// Parse and fully inline the supported OpenQASM 2 subset.
 pub fn parse(qasm: &str) -> Result<Circuit, String> {
     parse_with_limits(qasm, ParseLimits::default())
@@ -52,6 +57,26 @@ pub fn parse(qasm: &str) -> Result<Circuit, String> {
 
 /// Parse using explicit expansion limits, without changing the circuit model.
 pub fn parse_with_limits(qasm: &str, limits: ParseLimits) -> Result<Circuit, String> {
+    parse_with(qasm, limits, false)
+}
+
+/// Parse finite binary64 SDK literals without interpreting decimals as exact
+/// mathematical rationals. Custom bodies may bind those literals structurally.
+pub fn parse_numeric_sdk(qasm: &str) -> Result<Circuit, String> {
+    parse_with(qasm, ParseLimits::default(), true)
+}
+
+fn parse_with(qasm: &str, limits: ParseLimits, numeric_literals: bool) -> Result<Circuit, String> {
+    let mut angles = AngleParser {
+        numeric_literals,
+        context: crate::angle::AngleContext::with_limits(crate::angle::Limits {
+            max_depth: limits
+                .expression_depth
+                .min(crate::angle::Limits::default().max_depth),
+            ..crate::angle::Limits::default()
+        }),
+        ..AngleParser::default()
+    };
     if limits.expression_depth > 256 {
         return Err("expression nesting limit cannot exceed 256".into());
     }
@@ -83,7 +108,10 @@ pub fn parse_with_limits(qasm: &str, limits: ParseLimits) -> Result<Circuit, Str
                 &mut scanner,
                 &registers,
                 &cregisters,
-                limits,
+                Evaluation {
+                    limits,
+                    angles: &mut angles,
+                },
             )?;
             continue;
         }
@@ -177,7 +205,10 @@ pub fn parse_with_limits(qasm: &str, limits: ParseLimits) -> Result<Circuit, Str
                     line_num,
                     &registry,
                     &registers,
-                    limits,
+                    Evaluation {
+                        limits,
+                        angles: &mut angles,
+                    },
                     &mut budget,
                     &mut gates,
                 )?;
@@ -205,37 +236,200 @@ pub fn serialize(circuit: &Circuit) -> String {
     s
 }
 
+pub(crate) fn serialize_numeric(circuit: &Circuit) -> String {
+    let exact = serialize(circuit);
+    let mut out = String::with_capacity(exact.len());
+    for line in exact.lines() {
+        if let Some(start) = line.find('(') {
+            let end =
+                start + 1 + find_matching_paren(&line[start + 1..]).expect("serialized parameter");
+            let a = crate::angle_expr::parse(&line[start + 1..end], 0).expect("validated scalar");
+            let value = a
+                .to_f64_exact()
+                .expect("numeric export checked exact representability");
+            out.push_str(&line[..start + 1]);
+            out.push_str(&crate::angle::real_token(value));
+            out.push_str(&line[end..]);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn write_gate(s: &mut String, gate: &Gate) {
     use std::fmt::Write;
     match gate {
-        Gate::x(q) => writeln!(s, "x q[{q}];"),
-        Gate::h(q) => writeln!(s, "h q[{q}];"),
-        Gate::s(q) => writeln!(s, "s q[{q}];"),
-        Gate::sdg(q) => writeln!(s, "sdg q[{q}];"),
-        Gate::z(q) => writeln!(s, "z q[{q}];"),
-        Gate::t(q) => writeln!(s, "t q[{q}];"),
-        Gate::tdg(q) => writeln!(s, "tdg q[{q}];"),
-        Gate::rz(theta, q) => writeln!(s, "rz({theta}) q[{q}];"),
-        Gate::cnot { control, target } => writeln!(s, "cx q[{control}],q[{target}];"),
-        Gate::cz { control, target } => writeln!(s, "cz q[{control}],q[{target}];"),
-        Gate::ccx {
-            control1,
-            control2,
+        Gate::sx(q) => {
+            for term in [Gate::h(*q), Gate::s(*q), Gate::h(*q)] {
+                write_gate(s, &term);
+            }
+            return;
+        }
+        Gate::swap(a, b) => {
+            for (control, target) in [(*a, *b), (*b, *a), (*a, *b)] {
+                write_gate(s, &Gate::cnot { control, target });
+            }
+            return;
+        }
+        Gate::crx {
+            theta,
+            control,
+            target,
+        }
+        | Gate::cry {
+            theta,
+            control,
             target,
         } => {
-            writeln!(s, "ccx q[{control1}],q[{control2}],q[{target}];")
+            if matches!(gate, Gate::cry { .. }) {
+                write_gate(s, &Gate::sdg(*target));
+            }
+            write_gate(s, &Gate::h(*target));
+            write_gate(
+                s,
+                &Gate::crz {
+                    theta: theta.clone(),
+                    control: *control,
+                    target: *target,
+                },
+            );
+            write_gate(s, &Gate::h(*target));
+            if matches!(gate, Gate::cry { .. }) {
+                write_gate(s, &Gate::s(*target));
+            }
+            return;
         }
-        Gate::ccz {
-            control1,
-            control2,
-            target,
+        Gate::cswap {
+            control,
+            first,
+            second,
         } => {
-            writeln!(s, "ccz q[{control1}],q[{control2}],q[{target}];")
+            // CSWAP is absent from the original qelib1.inc. Preserve roles and
+            // every branch phase with this exact expansion.
+            for term in [
+                Gate::cnot {
+                    control: *first,
+                    target: *second,
+                },
+                Gate::ccx {
+                    control1: *control,
+                    control2: *second,
+                    target: *first,
+                },
+                Gate::cnot {
+                    control: *first,
+                    target: *second,
+                },
+            ] {
+                write_gate(s, &term);
+            }
+            return;
         }
-        Gate::measure { qubit, cbit } => writeln!(s, "measure q[{qubit}] -> c[{cbit}];"),
-        Gate::reset(q) => writeln!(s, "reset q[{q}];"),
+        Gate::rz(theta, _) | Gate::rx(theta, _) | Gate::ry(theta, _) | Gate::p(theta, _) => {
+            let name = if matches!(gate, Gate::p(..)) {
+                "u1"
+            } else {
+                gate.kind().name()
+            };
+            write!(s, "{name}({theta}) ").unwrap();
+        }
+        Gate::cp { lambda, .. } => {
+            write!(s, "cu1({lambda}) ").unwrap();
+        }
+        Gate::crz { theta, .. } => {
+            write!(s, "crz({theta}) ").unwrap();
+        }
+        Gate::x(_)
+        | Gate::h(_)
+        | Gate::s(_)
+        | Gate::sdg(_)
+        | Gate::z(_)
+        | Gate::t(_)
+        | Gate::tdg(_)
+        | Gate::y(_)
+        | Gate::reset(_)
+        | Gate::measure { .. }
+        | Gate::cnot { .. }
+        | Gate::cz { .. }
+        | Gate::cy { .. }
+        | Gate::ch { .. }
+        | Gate::ccx { .. }
+        | Gate::ccz { .. } => {
+            s.push_str(gate.kind().name());
+            s.push(' ');
+        }
     }
-    .unwrap();
+    let (arity, qubits) = crate::circuit::qubit_operands(gate);
+    for (index, &qubit) in qubits[..arity].iter().enumerate() {
+        if index != 0 {
+            s.push(',');
+        }
+        write!(s, "q[{qubit}]").unwrap();
+    }
+    if let Gate::measure { cbit, .. } = *gate {
+        s.push_str(" -> ");
+        write!(s, "c[{cbit}]").unwrap();
+    }
+    s.push_str(";\n");
+}
+
+#[derive(Default)]
+struct AngleParser {
+    numeric_literals: bool,
+    context: crate::angle::AngleContext,
+    cache: rustc_hash::FxHashMap<String, crate::angle::Angle>,
+}
+fn parse_angle_with(
+    parser: &mut AngleParser,
+    s: &str,
+    line: usize,
+) -> Result<crate::angle::Angle, String> {
+    let source = s.trim();
+    if let Some(a) = parser.cache.get(source) {
+        return Ok(a.clone());
+    }
+    if parser.numeric_literals {
+        return source
+            .parse::<f64>()
+            .map_err(|_| format!("line {line}: SDK parameter must be a numeric literal"))
+            .and_then(|v| {
+                crate::angle::Angle::from_f64(v).map_err(|e| format!("line {line}: {e}"))
+            });
+    }
+    let mut result = parser.context.parse(source);
+    if matches!(
+        result,
+        Err(crate::angle::AngleError::Limit(
+            crate::symbolic_angle::Resource::Nodes
+        ))
+    ) {
+        // Rotate the bounded weak lookup table, not the owned scalar storage.
+        // Per-expression limits are still enforced on the retry.
+        parser.context.clear_interner();
+        result = parser.context.parse(source);
+    }
+    let a = result.map_err(|e| format!("line {line}: {e}"))?;
+    if parser.cache.len() < 512 && source.len() <= 128 {
+        parser.cache.insert(source.to_string(), a.clone());
+    }
+    Ok(a)
+}
+
+/// Find the position of the closing `)` that matches depth 0,
+/// accounting for nested parentheses. Returns the index into `s`.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(i),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse a measure statement body (without the `measure ` prefix) and return one or more
@@ -331,6 +525,25 @@ fn resolve_qubits(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_gates_reject_bad_angles_operands_and_arity() {
+        for statement in [
+            "cp(NaN) q[0],q[1]",
+            "crx(inf) q[0],q[1]",
+            "cry(0.3 q[0],q[1]",
+            "crz(pi) q[3],q[0]",
+            "cy q[0]",
+            "ch q[0],q[1],q[2]",
+            "cswap q[0],q[1]",
+            "p(0.3) q[0],q[1]",
+        ] {
+            assert!(
+                parse(&format!("qreg q[3]; {statement};")).is_err(),
+                "{statement}"
+            );
+        }
+    }
+
     use super::*;
     use std::f64::consts::PI;
 
@@ -400,12 +613,15 @@ mod tests {
     #[test]
     fn rz_roundtrip() {
         let mut c = Circuit::new(1);
-        c.apply(Gate::rz(PI / 4.0, 0));
+        c.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 4.0", 1).unwrap(),
+            0,
+        ));
         let qasm = serialize(&c);
         let c2 = parse(&qasm).unwrap();
         assert_eq!(c2.gates.len(), 1);
         if let Gate::rz(theta, 0) = &c2.gates[0] {
-            assert!((theta - PI / 4.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI / 4.0).abs() < 1e-10);
         } else {
             panic!("expected rz gate");
         }
@@ -428,6 +644,75 @@ mod tests {
     }
 
     // --- comment parsing tests ---
+
+    #[test]
+    fn semicolons_in_line_comments_never_execute_gates() {
+        for body in [
+            "// ignored; x q[0];\nh q[0];",
+            "h q[0]; // ignored; x q[0];",
+            "// ignored; x q[0];\nh q[0]; // ignored; t q[0];",
+            "// unicode λ; x q[0];\nh q[0];",
+        ] {
+            let c = parse(&format!("OPENQASM 2.0;\nqreg q[1];\n{body}")).unwrap();
+            assert_eq!(c.gates, vec![Gate::h(0)], "{body}");
+        }
+    }
+
+    #[test]
+    fn block_comment_markers_inside_line_comments_do_not_erase_gates() {
+        for body in [
+            "// /*\nh q[0];\n// */",
+            "// /* unclosed\nh q[0];",
+            "// */ /* ; x q[0];\nh q[0];",
+        ] {
+            let c = parse(&format!("OPENQASM 2.0;\nqreg q[1];\n{body}")).unwrap();
+            assert_eq!(c.gates, vec![Gate::h(0)], "{body}");
+        }
+    }
+
+    #[test]
+    fn line_comment_markers_inside_block_comments_do_not_hide_the_end() {
+        let c = parse("OPENQASM 2.0;\nqreg q[1];\n/* // ; x q[0]; */ h q[0];").unwrap();
+        assert_eq!(c.gates, vec![Gate::h(0)]);
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_are_preserved() {
+        let source = "include \"directory//file/*name*/.inc\"; // /* ignored; x q[0];\nh q[0];";
+        let mut scanner = scan::Scanner::new(source);
+        assert_eq!(
+            scanner.next(true).unwrap().unwrap().text,
+            "include \"directory//file/*name*/.inc\""
+        );
+        assert_eq!(scanner.next(true).unwrap().unwrap().text, "h q[0]");
+        assert!(matches!(
+            scan::Scanner::new("include \"directory//file.inc\";")
+                .next(true)
+                .unwrap()
+                .unwrap()
+                .text,
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn block_comments_separate_tokens_instead_of_joining_them() {
+        for gate in ["r/* comment */z(1) q[0];", "rz(1/* comment */2) q[0];"] {
+            let source = format!("OPENQASM 2.0;\nqreg q[1];\n{gate}");
+            assert!(parse(&source).is_err(), "joined tokens in {gate}");
+        }
+        let c = parse("OPENQASM 2.0;\nqreg q[1];\nh/* comment */q[0];").unwrap();
+        assert_eq!(c.gates, vec![Gate::h(0)]);
+    }
+
+    #[test]
+    fn mixed_comments_preserve_error_line_numbers() {
+        let source =
+            "OPENQASM 2.0;\r\nqreg q[1];\r\n// /* ; x q[0];\r\n/* skip\nthis */\nrz(1/0) q[0];\n";
+        let err = parse(source).unwrap_err();
+        assert!(err.contains("line 6"), "{err}");
+        assert!(err.contains("finite"), "{err}");
+    }
 
     #[test]
     fn line_comment_only() {
@@ -548,21 +833,99 @@ t q[0];
 
     #[test]
     fn unsupported_gate_error() {
-        let qasm = "OPENQASM 2.0;\nqreg q[1];\nry(0.5) q[0];\n";
+        let qasm = "OPENQASM 2.0;\nqreg q[1];\nunknown(0.5,0.2,0.1) q[0];\n";
         let err = parse(qasm).unwrap_err();
         assert!(err.contains("line 3"));
         assert!(err.contains("unsupported"));
-        assert!(err.contains("ry"));
+        assert!(err.contains("unknown"));
     }
 
     // --- pi expression tests ---
+
+    #[test]
+    fn nonfinite_angles_and_intermediate_results_are_rejected() {
+        for expression in ["1/0", "0/0", "-1/0", "1/(1/0)", "0*(1/0)"] {
+            let source = format!("OPENQASM 2.0;\nqreg q[1];\nrz({expression}) q[0];\n");
+            let err = parse(&source).unwrap_err();
+            assert!(err.contains("line 3"), "{expression}: {err}");
+            assert!(err.contains("finite"), "{expression}: {err}");
+        }
+    }
+
+    #[test]
+    fn finite_extreme_angles_and_valid_division_are_accepted() {
+        for (expression, _expected) in [
+            ("0", 0.0),
+            ("1e308", 1e308),
+            ("-1e308", -1e308),
+            ("1e-300", 1e-300),
+            ("1e308/1e308", 1.0),
+            ("0/1", 0.0),
+        ] {
+            let source = format!("OPENQASM 2.0;\nqreg q[1];\nrz({expression}) q[0];\n");
+            assert_eq!(
+                parse(&source).unwrap().gates,
+                vec![Gate::rz(
+                    crate::angle::AngleContext::default()
+                        .parse(expression)
+                        .unwrap(),
+                    0
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn multi_qubit_gates_require_distinct_operands() {
+        for gate in ["cx", "cz"] {
+            for a in 0..3 {
+                for b in 0..3 {
+                    let source = format!("OPENQASM 2.0;\nqreg q[3];\n{gate} q[{a}],q[{b}];\n");
+                    let result = parse(&source);
+                    if a == b {
+                        let err = result.unwrap_err();
+                        assert!(
+                            err.contains("line 3")
+                                && err.contains(gate)
+                                && err.contains("distinct"),
+                            "{err}"
+                        );
+                    } else {
+                        assert!(result.is_ok(), "{source}");
+                    }
+                }
+            }
+        }
+        for gate in ["ccx", "ccz"] {
+            for a in 0..3 {
+                for b in 0..3 {
+                    for c in 0..3 {
+                        let source =
+                            format!("OPENQASM 2.0;\nqreg q[3];\n{gate} q[{a}],q[{b}],q[{c}];\n");
+                        let result = parse(&source);
+                        if a == b || a == c || b == c {
+                            let err = result.unwrap_err();
+                            assert!(
+                                err.contains("line 3")
+                                    && err.contains(gate)
+                                    && err.contains("distinct"),
+                                "{err}"
+                            );
+                        } else {
+                            assert!(result.is_ok(), "{source}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn rz_pi() {
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(pi) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - PI).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -573,7 +936,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(pi/4) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - PI / 4.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI / 4.0).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -584,7 +947,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(2*pi) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 2.0 * PI).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - 2.0 * PI).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -595,7 +958,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(3*pi/4) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 3.0 * PI / 4.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - 3.0 * PI / 4.0).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -606,7 +969,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(-pi/2) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - (-PI / 2.0)).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - (-PI / 2.0)).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -617,7 +980,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(-pi) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - (-PI)).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - (-PI)).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -628,7 +991,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(0.123456789) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 0.123456789).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - 0.123456789).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -639,7 +1002,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(20*pi) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 20.0 * PI).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - 20.0 * PI).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -650,7 +1013,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(pi*2) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 2.0 * PI).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - 2.0 * PI).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -661,7 +1024,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz( pi / 4 ) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - PI / 4.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI / 4.0).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -672,7 +1035,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz( 3 * pi / 4 ) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 3.0 * PI / 4.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - 3.0 * PI / 4.0).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -683,7 +1046,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(- pi / 4) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - (-PI / 4.0)).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - (-PI / 4.0)).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -694,7 +1057,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(0.5*pi) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 0.5 * PI).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - 0.5 * PI).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -705,7 +1068,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz((pi/4)) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - PI / 4.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI / 4.0).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -718,7 +1081,7 @@ t q[0];
         let c = parse(qasm).unwrap();
         let expected = 2.0 * 2.0 * (PI / 2.0) * (3.0 / 4.0 * PI);
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - expected).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - expected).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -729,7 +1092,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(pi/4 + pi/4) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - PI / 2.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI / 2.0).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -740,7 +1103,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(pi - pi/2) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - PI / 2.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI / 2.0).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -751,7 +1114,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(--pi) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - PI).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI).abs() < 1e-10);
         } else {
             panic!("expected rz");
         }
@@ -762,7 +1125,7 @@ t q[0];
         let qasm = "OPENQASM 2.0;\nqreg q[1];\nrz(1e-3) q[0];\n";
         let c = parse(qasm).unwrap();
         if let Gate::rz(theta, 0) = &c.gates[0] {
-            assert!((theta - 1e-3).abs() < 1e-15);
+            assert!((theta.to_f64_lossy().unwrap() - 1e-3).abs() < 1e-15);
         } else {
             panic!("expected rz");
         }
@@ -1615,7 +1978,7 @@ measure q[1] -> c[1];
         assert_eq!(c.num_qubits, 3);
         // b[1] -> offset 1 + index 1 = 2
         if let Gate::rz(theta, 2) = &c.gates[0] {
-            assert!((theta - PI / 4.0).abs() < 1e-10);
+            assert!((theta.to_f64_lossy().unwrap() - PI / 4.0).abs() < 1e-10);
         } else {
             panic!("expected rz on qubit 2, got {:?}", c.gates[0]);
         }
@@ -1683,4 +2046,23 @@ measure q[1] -> c[1];
         assert!(err.contains("unknown register"));
         assert!(err.contains("nosuch"));
     }
+}
+
+/// Explicit numeric export for consumers without symbolic pi parameters.
+/// Fraction conversion is approximate and its error is not certified.
+#[derive(Debug)]
+pub struct NumericExport {
+    pub qasm: String,
+    pub uncertified_conversions: usize,
+}
+
+pub fn serialize_numeric_lossy(circuit: &Circuit) -> Result<NumericExport, String> {
+    crate::angle_export::lossy(circuit)
+}
+
+/// Numeric-parameter QASM for SDKs, equivalent up to overall global phase.
+/// Named gates preserve mathematical quarter turns separately from floats.
+/// Unsupported symbolic angles fail; this function never approximates them.
+pub fn serialize_sdk(circuit: &Circuit) -> Result<String, String> {
+    crate::angle_export::sdk(circuit)
 }

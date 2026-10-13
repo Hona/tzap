@@ -1,48 +1,61 @@
-//! Resolved postfix expressions avoid recursive evaluation and AST destruction.
-use super::scan::identifier;
+//! Resolved postfix templates bind formal parameters to exact scalar angles.
+use super::{AngleParser, parse_angle_with, scan::identifier};
+use crate::angle::{Angle, AngleContext, AngleError};
+use crate::symbolic_angle::{Function, Resource};
 
 #[derive(Clone, Debug)]
 enum Op {
-    Value(f64),
+    Value(Angle),
     Parameter(usize),
     Add,
     Sub,
     Mul,
     Div,
+    Pow,
     Neg,
+    Function(Function),
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct Expr {
     code: Vec<Op>,
-    constant: Option<f64>,
+    constant: Option<Angle>,
 }
 
-fn finite(value: f64) -> Result<f64, String> {
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err("angle expression must be finite".into())
+fn scalar(
+    parser: &mut AngleParser,
+    mut action: impl FnMut(&mut AngleContext) -> Result<Angle, AngleError>,
+) -> Result<Angle, String> {
+    let mut result = action(&mut parser.context);
+    if matches!(result, Err(AngleError::Limit(Resource::Nodes))) {
+        parser.context.clear_interner();
+        result = action(&mut parser.context);
     }
+    result.map_err(|e| e.to_string())
 }
-
-fn binary(op: &Op, a: f64, b: f64) -> Result<f64, String> {
-    finite(match op {
-        Op::Add => a + b,
-        Op::Sub => a - b,
-        Op::Mul => a * b,
-        Op::Div => {
-            if b == 0.0 {
-                return Err("division by zero in angle expression".into());
-            }
-            a / b
+fn binary(parser: &mut AngleParser, op: &Op, a: &Angle, b: &Angle) -> Result<Angle, String> {
+    scalar(parser, |ctx| match op {
+        Op::Add => ctx.add(a, b),
+        Op::Sub => ctx.sub(a, b),
+        Op::Mul => ctx.mul(a, b),
+        Op::Div => ctx.div(a, b),
+        Op::Pow => {
+            let exponent = b
+                .as_rational()
+                .filter(|r| r.is_integer())
+                .and_then(|r| r.as_small())
+                .map(|(n, _)| n)
+                .ok_or(AngleError::Parse {
+                    offset: 0,
+                    message: "only bounded integer exponents are supported",
+                })?;
+            ctx.pow(a, exponent)
         }
         _ => unreachable!(),
     })
 }
 
 impl Expr {
-    /// Cached constants take one step; other expressions execute all opcodes.
     pub fn work(&self) -> usize {
         if self.constant.is_some() {
             1
@@ -50,128 +63,131 @@ impl Expr {
             self.code.len()
         }
     }
-    pub fn parse(source: &str, parameters: &[String], max_depth: usize) -> Result<Self, String> {
+    pub fn parse(
+        source: &str,
+        parameters: &[String],
+        max_depth: usize,
+        angles: &mut AngleParser,
+        line: usize,
+    ) -> Result<Self, String> {
+        // Closed expressions share main's exact parser/cache and SDK policy.
+        if parameters.is_empty() {
+            return Ok(Self {
+                code: Vec::new(),
+                constant: Some(parse_angle_with(angles, source, line)?),
+            });
+        }
+        if source.len() > angles.context.limits().max_source_bytes {
+            return Err(format!(
+                "line {line}: symbolic angle resource limit: Source"
+            ));
+        }
         let mut parser = Parser {
             source,
             pos: 0,
             parameters,
             max_depth,
+            angles,
+            line,
             code: Vec::new(),
         };
-        parser.space();
-        if parser.pos == source.len() {
-            return Err("empty angle expression".into());
-        }
-        let constant = parser.expr(0)?;
-        parser.space();
-        if parser.pos != source.len() {
-            let c = source[parser.pos..].chars().next().unwrap();
-            if !c.is_ascii_alphanumeric() && !matches!(c, '_' | '.' | '(' | ')') {
-                return Err(format!("unexpected character '{c}' in angle expression"));
-            }
-            return Err("unexpected token in angle expression".into());
+        let constant = parser
+            .expression(0, 0)
+            .map_err(|e| format!("line {line}: {e}"))?;
+        if parser.peek().is_some() {
+            return Err(format!("line {line}: unexpected token in angle expression"));
         }
         Ok(Self {
             code: parser.code,
             constant,
         })
     }
-
-    pub fn evaluate(&self, parameters: &[f64]) -> Result<f64, String> {
-        if let Some(value) = self.constant {
-            return Ok(value);
+    pub fn evaluate(
+        &self,
+        parameters: &[Angle],
+        angles: &mut AngleParser,
+    ) -> Result<Angle, String> {
+        if let Some(value) = &self.constant {
+            return Ok(value.clone());
         }
-        let mut stack = smallvec::SmallVec::<[f64; 8]>::new();
+        let mut stack = smallvec::SmallVec::<[Angle; 8]>::new();
         for op in &self.code {
             match op {
-                Op::Value(v) => stack.push(*v),
-                Op::Parameter(i) => stack.push(parameters[*i]),
+                Op::Value(v) => stack.push(v.clone()),
+                Op::Parameter(i) => stack.push(parameters[*i].clone()),
                 Op::Neg => {
                     let v = stack.last_mut().unwrap();
-                    *v = -*v;
+                    *v = scalar(angles, |ctx| ctx.neg(v))?;
+                }
+                Op::Function(fun) => {
+                    let v = stack.last_mut().unwrap();
+                    *v = scalar(angles, |ctx| ctx.function(*fun, v))?;
                 }
                 _ => {
                     let b = stack.pop().unwrap();
                     let a = stack.last_mut().unwrap();
-                    *a = binary(op, *a, b)?;
+                    *a = binary(angles, op, a, &b)?;
                 }
             }
         }
-        finite(stack[0])
+        Ok(stack.pop().unwrap())
     }
 }
 
-struct Parser<'a> {
+struct Parser<'a, 'c> {
     source: &'a str,
     pos: usize,
     parameters: &'a [String],
     max_depth: usize,
+    angles: &'c mut AngleParser,
+    line: usize,
     code: Vec<Op>,
 }
-
-impl Parser<'_> {
-    fn space(&mut self) {
-        while self.pos < self.source.len() && self.source.as_bytes()[self.pos].is_ascii_whitespace()
+impl Parser<'_, '_> {
+    fn literal(&mut self, source: &str) -> Result<Angle, String> {
+        parse_angle_with(self.angles, source, self.line).map_err(|e| {
+            e.strip_prefix(&format!("line {}: ", self.line))
+                .unwrap_or(&e)
+                .to_owned()
+        })
+    }
+    fn peek(&mut self) -> Option<u8> {
+        while self
+            .source
+            .as_bytes()
+            .get(self.pos)
+            .is_some_and(u8::is_ascii_whitespace)
         {
             self.pos += 1;
         }
-    }
-    fn peek(&mut self) -> Option<u8> {
-        self.space();
         self.source.as_bytes().get(self.pos).copied()
     }
-
-    fn expr(&mut self, depth: usize) -> Result<Option<f64>, String> {
-        let mut value = self.term(depth)?;
-        while let Some(c @ (b'+' | b'-')) = self.peek() {
-            self.pos += 1;
-            let rhs = self.term(depth)?;
-            let op = if c == b'+' { Op::Add } else { Op::Sub };
-            value = match (value, rhs) {
-                (Some(a), Some(b)) => Some(binary(&op, a, b)?),
-                _ => None,
-            };
-            self.code.push(op);
-        }
-        Ok(value)
-    }
-    fn term(&mut self, depth: usize) -> Result<Option<f64>, String> {
-        let mut value = self.atom(depth)?;
-        while let Some(c @ (b'*' | b'/')) = self.peek() {
-            self.pos += 1;
-            let rhs = self.atom(depth)?;
-            let op = if c == b'*' { Op::Mul } else { Op::Div };
-            if matches!(op, Op::Div) && rhs == Some(0.0) {
-                return Err("division by zero in angle expression".into());
-            }
-            value = match (value, rhs) {
-                (Some(a), Some(b)) => Some(binary(&op, a, b)?),
-                _ => None,
-            };
-            self.code.push(op);
-        }
-        Ok(value)
-    }
-    fn atom(&mut self, depth: usize) -> Result<Option<f64>, String> {
+    fn expression(&mut self, binding: u8, depth: usize) -> Result<Option<Angle>, String> {
         if depth >= self.max_depth {
             return Err("expression nesting limit exceeded".into());
         }
-        let c = self.peek().ok_or("unexpected end of angle expression")?;
-        match c {
+        let mut value = match self.peek().ok_or("expected a number, pi, or function")? {
             b'-' => {
                 self.pos += 1;
-                let value = self.atom(depth + 1)?.map(|v| -v);
+                let value = self
+                    .expression(5, depth + 1)?
+                    .map(|a| scalar(self.angles, |ctx| ctx.neg(&a)))
+                    .transpose()?;
                 self.code.push(Op::Neg);
-                Ok(value)
+                value
+            }
+            b'+' => {
+                self.pos += 1;
+                self.expression(5, depth + 1)?
             }
             b'(' => {
                 self.pos += 1;
-                let value = self.expr(depth + 1)?;
+                let value = self.expression(0, depth + 1)?;
                 if self.peek() != Some(b')') {
-                    return Err("unclosed parenthesis in angle expression".into());
+                    return Err("expected closing parenthesis".into());
                 }
                 self.pos += 1;
-                Ok(value)
+                value
             }
             b'0'..=b'9' | b'.' => {
                 let start = self.pos;
@@ -190,34 +206,71 @@ impl Parser<'_> {
                         self.pos += 1;
                     }
                 }
-                let value = self.source[start..self.pos]
-                    .parse()
-                    .map_err(|e| format!("bad number: {e}"))?;
-                let value = finite(value)?;
-                self.code.push(Op::Value(value));
-                Ok(Some(value))
+                let a = self.literal(&self.source[start..self.pos])?;
+                self.code.push(Op::Value(a.clone()));
+                Some(a)
             }
             c if c.is_ascii_alphabetic() => {
                 let (name, _) = identifier(&self.source[self.pos..]);
                 self.pos += name.len();
-                if name == "pi" {
-                    let value = std::f64::consts::PI;
-                    self.code.push(Op::Value(value));
-                    Ok(Some(value))
-                } else {
-                    let i = self
-                        .parameters
-                        .iter()
-                        .position(|n| n == name)
-                        .ok_or_else(|| format!("unknown parameter '{name}' in angle expression"))?;
+                if let Some(i) = self.parameters.iter().position(|n| n == name) {
                     self.code.push(Op::Parameter(i));
-                    Ok(None)
+                    None
+                } else if name == "pi" {
+                    let a = self.literal("pi")?;
+                    self.code.push(Op::Value(a.clone()));
+                    Some(a)
+                } else {
+                    let fun = match name {
+                        "sin" => Function::Sin,
+                        "cos" => Function::Cos,
+                        "tan" => Function::Tan,
+                        "exp" => Function::Exp,
+                        "ln" => Function::Ln,
+                        "sqrt" => Function::Sqrt,
+                        _ => return Err(format!("unknown parameter '{name}' in angle expression")),
+                    };
+                    if self.peek() != Some(b'(') {
+                        return Err("expected function argument".into());
+                    }
+                    self.pos += 1;
+                    let value = self.expression(0, depth + 1)?;
+                    if self.peek() != Some(b')') {
+                        return Err("expected closing function parenthesis".into());
+                    }
+                    self.pos += 1;
+                    let value = value
+                        .map(|a| scalar(self.angles, |ctx| ctx.function(fun, &a)))
+                        .transpose()?;
+                    self.code.push(Op::Function(fun));
+                    value
                 }
             }
-            _ => Err(format!(
-                "unexpected character '{}' in angle expression",
-                self.source[self.pos..].chars().next().unwrap()
-            )),
+            _ => return Err("expected a number, pi, or function".into()),
+        };
+        while let Some(op) = self.peek() {
+            let (left, right, op) = match op {
+                b'+' => (1, 2, Op::Add),
+                b'-' => (1, 2, Op::Sub),
+                b'*' => (3, 4, Op::Mul),
+                b'/' => (3, 4, Op::Div),
+                b'^' => (7, 6, Op::Pow),
+                _ => break,
+            };
+            if left < binding {
+                break;
+            }
+            self.pos += 1;
+            let rhs = self.expression(right, depth + 1)?;
+            if matches!(op, Op::Div) && rhs.as_ref().is_some_and(|a| a == &Angle::ZERO) {
+                return Err("angle expression must be finite: division by zero".into());
+            }
+            value = match (value, rhs) {
+                (Some(a), Some(b)) => Some(binary(self.angles, &op, &a, &b)?),
+                _ => None,
+            };
+            self.code.push(op);
         }
+        Ok(value)
     }
 }

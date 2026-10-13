@@ -206,11 +206,11 @@ fn unsupported_inputs_fail_even_without_output_destination() {
         ("reset q[0];", "gate 1 (reset q0): PBC has no resets"),
         (
             "rz(pi/5) q[0];",
-            "gate 1 (rz(0.6283) q0): Rz needs --decompose-rz",
+            "gate 1 (rz(((1/5)*pi)) q0): Rotations need --decompose-rotations",
         ),
         (
             "h q[1];\ncx q[0],q[0];",
-            "cx requires distinct qubit operands",
+            "line 6: cx requires distinct qubit operands",
         ),
     ] {
         let run = Tzap::new(&["-", "--to-pbc", "--passes", "CancelGates"])
@@ -569,8 +569,8 @@ fn to_pbc_and_pbc_opt_are_passes() {
     }
 }
 
-/// PBC input problems are reported before any gate-level work, naming the
-/// instruction; --fixpoint needs gate passes to repeat.
+/// Invalid gate operands are rejected by the parser before any PBC or
+/// gate-level work; --fixpoint needs gate passes to repeat.
 #[test]
 fn pbc_input_is_checked_before_optimization() {
     let run = Tzap::new(&["-", "--to-pbc", "-O3"])
@@ -578,7 +578,8 @@ fn pbc_input_is_checked_before_optimization() {
         .run()
         .failed("repeated operand");
     assert!(
-        run.stderr.contains("cx requires distinct qubit operands"),
+        run.stderr
+            .contains("line 7: cx requires distinct qubit operands"),
         "{}",
         run.stderr
     );

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
@@ -24,12 +25,34 @@ class Metrics:
 
 
 @dataclass(frozen=True)
+class NumericalReport:
+    """No added rounding in folding; input interpretation and synthesis differ."""
+
+    preserved_expressions: int
+    numerical_fallbacks: int
+    skipped_rounded_folds: int
+    skipped_nonfinite_folds: int
+    skipped_coefficient_limit_folds: int
+    uncertified_syntheses: int
+    randomized_matching: bool
+    certified_syntheses: int = 0
+    failed_certifications: int = 0
+    certified_error_bound: float | None = 0.0
+    input_policy: str = "exact_symbolic"
+    folding: str = "no_added_rounding"
+    synthesis_error_scope: str = (
+        "accepted_angle_per_input_gate; summed_bound_covers_synthesis_only"
+    )
+
+
+@dataclass(frozen=True)
 class OptimizationReport:
     """Input/baseline metrics and metrics after the staged optimization."""
 
     input: Metrics
     baseline: Metrics
     output: Metrics
+    numerical: NumericalReport
 
 
 @dataclass(frozen=True)
@@ -50,6 +73,7 @@ def optimize_qasm(
     level: str = "O3",
     passes: Iterable[str] | None = None,
     fixpoint: bool = False,
+    decompose_rotations: bool = False,
     decompose_rz: bool = False,
     decompose_cz: bool = False,
     decompose_ccx: bool = False,
@@ -66,8 +90,9 @@ def optimize_qasm(
     ``"Osuper"``. Supplying ``passes`` replaces the level's default pipeline.
     Pass names are the same as the CLI's ``--passes`` names.
 
-    Native ``ccx``, ``ccz``, ``cz``, and ``rz`` gates are preserved unless
-    their matching ``decompose_*`` option is enabled. ``superopt_gates`` is
+    Native ``ccx``, ``ccz``, ``cz``, phase gates, and rotations are preserved unless
+    their matching ``decompose_*`` option is enabled. ``decompose_rotations``
+    lowers P, RZ/RX/RY, CP, and CRZ/CRX/CRY; ``decompose_rz`` is a compatibility alias. ``superopt_gates`` is
     ``"auto"``, ``"base"``, or an explicit comma-separated synthesis basis.
 
     The CPU-heavy optimizer releases Python's GIL while it runs.
@@ -80,6 +105,7 @@ def optimize_qasm(
         level=level,
         passes=pass_list,
         fixpoint=fixpoint,
+        decompose_rotations=decompose_rotations,
         decompose_rz=decompose_rz,
         decompose_cz=decompose_cz,
         decompose_ccx=decompose_ccx,
@@ -94,5 +120,12 @@ def optimize_qasm(
         input=_metrics(raw_report[0]),
         baseline=_metrics(raw_report[1]),
         output=_metrics(raw_report[2]),
+        numerical=NumericalReport(*raw_report[3]),
     )
+    if report.numerical.preserved_expressions:
+        warnings.warn(
+            f"tzap retained {report.numerical.preserved_expressions} angle expressions unchanged because exact representation or folding exceeded its limits",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return OptimizationResult(optimized, report)

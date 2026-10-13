@@ -406,7 +406,7 @@ fn toffolis(circuit: &Circuit) -> usize {
 /// the offending instruction: resets, gates repeating a qubit, and Rz gates
 /// that no requested pass decomposes.
 fn check_pbc_input(ui: &Ui, run: &Run, circuit: &Circuit) {
-    let decomposes_rz = run.options.decompose_rz
+    let decomposes_rz = run.options.decompose_rotations_enabled()
         || run
             .options
             .passes
@@ -415,8 +415,17 @@ fn check_pbc_input(ui: &Ui, run: &Run, circuit: &Circuit) {
     for (index, gate) in circuit.gates.iter().enumerate() {
         let problem = match gate {
             Gate::reset(_) => "PBC has no resets",
-            Gate::rz(..) if !decomposes_rz => {
-                "Rz needs --decompose-rz (or DecomposeRz in --passes) before PBC conversion"
+            Gate::rz(..)
+            | Gate::p(..)
+            | Gate::rx(..)
+            | Gate::ry(..)
+            | Gate::cp { .. }
+            | Gate::crx { .. }
+            | Gate::cry { .. }
+            | Gate::crz { .. }
+                if !decomposes_rz =>
+            {
+                "Rotations need --decompose-rotations (or DecomposeRotations in --passes) before PBC conversion"
             }
             _ => {
                 let mut qubits = tzap::circuit::qubits_of(gate);
@@ -790,6 +799,15 @@ fn main() {
     ));
     let bare_pbc = run.to_pbc && run.options.passes.as_ref().is_some_and(Vec::is_empty);
     let parsed = read_circuit(&ui, &run.input_path, bare_pbc);
+    let preserved = parsed
+        .circuit
+        .gates
+        .iter()
+        .filter(|g| matches!(g, Gate::rz(a, _) if a.is_preserved()))
+        .count();
+    if preserved != 0 {
+        ui.note(&format!("Warning: {preserved} angle expressions retained unchanged because exact representation or folding exceeded its limits"));
+    }
     // Said out loud only when the size decided it: a run nobody asked to
     // parallelize otherwise reaches the chunked progress box with no
     // explanation, and a slightly different gate count at the end.
@@ -835,6 +853,7 @@ fn main() {
             input: metrics,
             baseline: metrics,
             output: metrics,
+            numerical: tzap::angle_stats::NumericalReport::input(&parsed.circuit, &run.options),
         };
         (parsed.circuit.clone(), report)
     } else if run.to_pbc {
@@ -887,6 +906,13 @@ fn main() {
     } else {
         optimize_with(&parsed.circuit, &run.options, &observer).unwrap_or_else(|e| arg_error(e))
     };
+    if report.numerical.certified_syntheses != 0 {
+        let count = report.numerical.certified_syntheses;
+        let noun = if count == 1 { "gate" } else { "gates" };
+        ui.note(&format!(
+            "{count} rotation {noun} certified against accepted angles; epsilon applies per input gate; summed bound covers synthesis only"
+        ));
+    }
     let pbc = finish(ui, &report, &result, &run, start);
 
     if json {

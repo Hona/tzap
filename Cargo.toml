@@ -3,7 +3,7 @@
 # unrelated project) — the lib/bin names below keep everything else (the
 # `tzap` binary, `use tzap::...` throughout this crate) unchanged.
 name = "tzap-opt"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "A super fast, Rust-based optimizer for large Clifford+T circuits"
 license = "Apache-2.0"
@@ -29,13 +29,17 @@ rsgridsynth = "0.2.2"
 rustc-hash = "2"
 smallvec = "1"
 memchr = "2"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-rational = "0.4"
+num-traits = "0.2"
+dashu-float = "=0.4.3"
+dashu-int = "0.4"
 
 [features]
 python = ["dep:pyo3"]
 
 [dev-dependencies]
-num-bigint = "0.4"
-num-rational = "0.4"
 tempfile = "3"
 rand = "0.8"
 

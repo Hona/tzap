@@ -122,6 +122,24 @@ impl Mat {
         }
     }
 
+    fn apply_controlled_single(&mut self, g: [[C; 2]; 2], control: Qubit, target: Qubit, n: usize) {
+        let (cb, tb) = (
+            1 << (n - 1 - control as usize),
+            1 << (n - 1 - target as usize),
+        );
+        for row in 0..self.dim {
+            if row & cb == 0 || row & tb != 0 {
+                continue;
+            }
+            let other = row | tb;
+            for col in 0..self.dim {
+                let (a, b) = (self.get(row, col), self.get(other, col));
+                self.set(row, col, g[0][0] * a + g[0][1] * b);
+                self.set(other, col, g[1][0] * a + g[1][1] * b);
+            }
+        }
+    }
+
     /// Apply a controlled-NOT: flip target bit when control bit is set.
     fn apply_cnot(&mut self, control: usize, target: usize, num_qubits: usize) {
         let cb = 1 << (num_qubits - 1 - control);
@@ -218,11 +236,97 @@ fn gate_matrix_tdg() -> [[C; 2]; 2] {
     [[C::ONE, C::ZERO], [C::ZERO, C::polar(1.0, -PI / 4.0)]]
 }
 
-fn gate_matrix_rz(theta: f64) -> [[C; 2]; 2] {
-    [
-        [C::polar(1.0, -theta / 2.0), C::ZERO],
-        [C::ZERO, C::polar(1.0, theta / 2.0)],
-    ]
+fn gate_matrix_y() -> [[C; 2]; 2] {
+    [[C::ZERO, C::new(0.0, -1.0)], [C::new(0.0, 1.0), C::ZERO]]
+}
+
+fn gate_matrix_sx() -> [[C; 2]; 2] {
+    let diagonal = C::new(0.5, 0.5);
+    let off_diagonal = C::new(0.5, -0.5);
+    [[diagonal, off_diagonal], [off_diagonal, diagonal]]
+}
+
+// A floating reference, not a certificate: multiply the symbolic and numeric
+// phases separately. Converting their sum to one float can erase a quarter turn
+// and make the oracle agree with the same bug in an SDK adapter.
+fn angle_phase(angle: &crate::angle::Angle, half: bool) -> C {
+    use crate::symbolic_angle::{Function, view::ExpressionRef};
+    use num_traits::ToPrimitive;
+    fn number(r: &crate::symbolic_angle::Rational) -> f64 {
+        r.to_big_rational()
+            .to_f64()
+            .expect("finite reference scalar")
+    }
+    fn reference(a: &crate::angle::Angle) -> f64 {
+        match a.expression() {
+            ExpressionRef::Rational(r) => number(&r),
+            ExpressionRef::Pi(r) => number(&r) * PI,
+            ExpressionRef::Sum(terms) => terms.map(|(c, a)| number(c) * reference(a)).sum(),
+            ExpressionRef::Product {
+                coefficient,
+                factors,
+            } => number(coefficient) * factors.iter().map(reference).product::<f64>(),
+            ExpressionRef::Quotient(a, b) => reference(a) / reference(b),
+            ExpressionRef::Power(a, n) => reference(a).powf(n as f64),
+            ExpressionRef::Function(f, a) => {
+                let x = reference(a);
+                match f {
+                    Function::Sin => x.sin(),
+                    Function::Cos => x.cos(),
+                    Function::Tan => x.tan(),
+                    Function::Exp => x.exp(),
+                    Function::Ln => x.ln(),
+                    Function::Sqrt => x.sqrt(),
+                }
+            }
+        }
+    }
+    fn phase_of(a: &crate::angle::Angle, scale: &num_rational::BigRational, half: bool) -> C {
+        let divisor = if half { 2.0 } else { 1.0 };
+        match a.expression() {
+            ExpressionRef::Pi(p) => {
+                let r = p.to_big_rational() * scale;
+                let period = if half { 4 } else { 2 };
+                let n = r.numer() % (r.denom() * period);
+                C::polar(
+                    1.0,
+                    num_rational::BigRational::new(n, r.denom().clone())
+                        .to_f64()
+                        .unwrap()
+                        * PI
+                        / divisor,
+                )
+            }
+            ExpressionRef::Sum(terms) => terms.fold(C::ONE, |phase, (c, a)| {
+                phase * phase_of(a, &(scale * c.to_big_rational()), half)
+            }),
+            _ => C::polar(1.0, reference(a) * scale.to_f64().unwrap() / divisor),
+        }
+    }
+    phase_of(
+        angle,
+        &num_rational::BigRational::from_integer(1.into()),
+        half,
+    )
+}
+fn gate_matrix_p(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    [[C::ONE, C::ZERO], [C::ZERO, angle_phase(theta, false)]]
+}
+fn gate_matrix_rx(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    let phase = angle_phase(theta, true);
+    let diagonal = C::new(phase.re, 0.0);
+    let off_diagonal = C::new(0.0, -phase.im);
+    [[diagonal, off_diagonal], [off_diagonal, diagonal]]
+}
+fn gate_matrix_ry(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    let phase = angle_phase(theta, true);
+    let c = C::new(phase.re, 0.0);
+    let s = C::new(phase.im, 0.0);
+    [[c, s * -1.0], [s, c]]
+}
+fn gate_matrix_rz(theta: &crate::angle::Angle) -> [[C; 2]; 2] {
+    let phase = angle_phase(theta, true);
+    [[phase.conj(), C::ZERO], [C::ZERO, phase]]
 }
 
 pub(crate) fn circuit_unitary(circuit: &Circuit) -> Vec<Vec<C>> {
@@ -237,7 +341,69 @@ pub(crate) fn circuit_unitary(circuit: &Circuit) -> Vec<Vec<C>> {
             Gate::z(q) => mat.apply_single(gate_matrix_z(), *q as usize, n),
             Gate::t(q) => mat.apply_single(gate_matrix_t(), *q as usize, n),
             Gate::tdg(q) => mat.apply_single(gate_matrix_tdg(), *q as usize, n),
-            Gate::rz(theta, q) => mat.apply_single(gate_matrix_rz(*theta), *q as usize, n),
+            Gate::rz(theta, q) => mat.apply_single(gate_matrix_rz(theta), *q as usize, n),
+            Gate::p(theta, q) => mat.apply_single(gate_matrix_p(theta), *q as usize, n),
+            Gate::y(q) => mat.apply_single(gate_matrix_y(), *q as usize, n),
+            Gate::sx(q) => mat.apply_single(gate_matrix_sx(), *q as usize, n),
+            Gate::rx(theta, q) => mat.apply_single(gate_matrix_rx(theta), *q as usize, n),
+            Gate::ry(theta, q) => mat.apply_single(gate_matrix_ry(theta), *q as usize, n),
+            Gate::cy { control, target } => {
+                mat.apply_controlled_single(gate_matrix_y(), *control, *target, n)
+            }
+            Gate::ch { control, target } => {
+                mat.apply_controlled_single(gate_matrix_h(), *control, *target, n)
+            }
+            Gate::cp {
+                lambda,
+                control,
+                target,
+            } => mat.apply_controlled_single(gate_matrix_p(lambda), *control, *target, n),
+            Gate::crx {
+                theta,
+                control,
+                target,
+            } => mat.apply_controlled_single(gate_matrix_rx(theta), *control, *target, n),
+            Gate::cry {
+                theta,
+                control,
+                target,
+            } => mat.apply_controlled_single(gate_matrix_ry(theta), *control, *target, n),
+            Gate::crz {
+                theta,
+                control,
+                target,
+            } => mat.apply_controlled_single(gate_matrix_rz(theta), *control, *target, n),
+            Gate::cswap {
+                control,
+                first,
+                second,
+            } => {
+                let (cb, a, b) = (
+                    1 << (n - 1 - *control as usize),
+                    1 << (n - 1 - *first as usize),
+                    1 << (n - 1 - *second as usize),
+                );
+                for row in 0..mat.dim {
+                    if row & cb != 0 && row & a == 0 && row & b != 0 {
+                        let other = row ^ a ^ b;
+                        for col in 0..mat.dim {
+                            mat.data.swap(row * mat.dim + col, other * mat.dim + col);
+                        }
+                    }
+                }
+            }
+            Gate::swap(a, b) => {
+                let mask_a = 1 << (n - 1 - *a as usize);
+                let mask_b = 1 << (n - 1 - *b as usize);
+                for row in 0..mat.dim {
+                    if row & mask_a == 0 && row & mask_b != 0 {
+                        let other = row ^ mask_a ^ mask_b;
+                        for col in 0..mat.dim {
+                            mat.data.swap(row * mat.dim + col, other * mat.dim + col);
+                        }
+                    }
+                }
+            }
             Gate::cnot { control, target } => {
                 mat.apply_cnot(*control as usize, *target as usize, n)
             }
@@ -376,7 +542,10 @@ mod tests {
         let mut a = Circuit::new(1);
         a.apply(Gate::s(0));
         let mut b = Circuit::new(1);
-        b.apply(Gate::rz(PI / 2.0, 0));
+        b.apply(Gate::rz(
+            crate::angle_expr::parse("pi / 2.0", 1).unwrap(),
+            0,
+        ));
         assert!(circuits_equiv(&a, &b, 1e-10));
     }
 
@@ -709,7 +878,7 @@ mod tests {
         let mut a = Circuit::new(1);
         a.apply(Gate::z(0));
         let mut b = Circuit::new(1);
-        b.apply(Gate::rz(PI, 0));
+        b.apply(Gate::rz(crate::angle_expr::parse("pi", 1).unwrap(), 0));
         assert!(circuits_equiv(&a, &b, 1e-10));
     }
 
@@ -718,7 +887,10 @@ mod tests {
         let mut a = Circuit::new(1);
         a.apply(Gate::sdg(0));
         let mut b = Circuit::new(1);
-        b.apply(Gate::rz(-PI / 2.0, 0));
+        b.apply(Gate::rz(
+            crate::angle_expr::parse("-pi / 2.0", 1).unwrap(),
+            0,
+        ));
         assert!(circuits_equiv(&a, &b, 1e-10));
     }
 
@@ -1058,7 +1230,10 @@ mod tests {
         a.apply(Gate::z(0));
         a.apply(Gate::t(0));
         let mut b = Circuit::new(1);
-        b.apply(Gate::rz(5.0 * PI / 4.0, 0));
+        b.apply(Gate::rz(
+            crate::angle_expr::parse("5.0 * pi / 4.0", 1).unwrap(),
+            0,
+        ));
         assert!(circuits_equiv(&a, &b, 1e-10));
     }
 
@@ -1110,4 +1285,40 @@ mod tests {
         b.apply(Gate::t(0));
         assert!(circuits_equiv(&a, &b, 1e-10));
     }
+}
+
+#[cfg(test)]
+mod native_tests;
+
+#[test]
+fn floating_reference_detects_lost_symbolic_quarter_turns() {
+    use crate::angle::Angle;
+    for magnitude in [1e17, -1e17, f64::MAX] {
+        let numeric = Angle::from_f64(magnitude).unwrap();
+        let mixed = Angle::pi_fraction(1, 4)
+            .unwrap()
+            .checked_add_signed(1, &numeric)
+            .unwrap();
+        let before = Circuit {
+            num_qubits: 1,
+            num_cbits: 0,
+            gates: vec![Gate::p(mixed, 0)],
+        };
+        let wrong = Circuit {
+            num_qubits: 1,
+            num_cbits: 0,
+            gates: vec![Gate::p(numeric, 0)],
+        };
+        assert!(!circuits_equiv(&before, &wrong, 1e-12));
+    }
+    let branch_phase = Circuit {
+        num_qubits: 2,
+        num_cbits: 0,
+        gates: vec![Gate::crz {
+            theta: Angle::pi_fraction(2, 1).unwrap(),
+            control: 0,
+            target: 1,
+        }],
+    };
+    assert!(!circuits_equiv(&branch_phase, &Circuit::new(2), 1e-12));
 }

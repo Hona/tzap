@@ -94,7 +94,7 @@ $ tzap benchmarks/feynman/hwb12.qasm -o optimized.qasm
 
 | Level | Description |
 |---|---|
-| `-O1` | phase folding + basic gate cancellation. Fastest; captures most of the T-gate reduction. |
+| `-O1` | phase folding (`PhaseFoldRand`, then `PhaseFoldPauli`) + basic gate cancellation. Fastest; captures most of the T-gate reduction. |
 | `-O2` | Adds superoptimization to `-O1`. |
 | **`-O3`** | **Default.** Repeats `-O2` until reaching a fixpoint.  |
 | `-Osuper` | Like `-O3`, but with more superoptimization power (slower on first use). |
@@ -103,13 +103,17 @@ $ tzap benchmarks/feynman/hwb12.qasm -o optimized.qasm
 tzap benchmarks/feynman/hwb12.qasm -O1 -o optimized.qasm
 ```
 
+`PhaseFoldPauli` folds native P/RX/RY/RZ rotations across commuting operations.
+It retains exact pi fractions and declines numeric sums that add rounding.
+
 **Optional decomposition**
 
-CCX, CCZ, CZ, and Rz stay native by default. To decompose them, use:
+CCX, CCZ, CZ, phase gates, and ordinary/controlled rotations stay native by default. To decompose them, use:
 
 - `--decompose-ccx` to decompose CCX and CCZ
 - `--decompose-cz` to decompose CZ into CX+H
-- `--decompose-rz` to decompose Rz via gridsynth
+- `--decompose-rotations` to decompose P, Rz/Rx/Ry, CP, and CRz/CRx/CRy via gridsynth
+  (`--decompose-rz` remains a compatibility alias)
 
 **PBC circuits**
 
@@ -119,17 +123,18 @@ Use `--to-pbc` to convert a circuit to PBC and optimize its Pauli rotations:
 tzap input.qasm --to-pbc -o output.pbc
 ```
 
-Use `--decompose-rz` when the input contains Rz gates; resets are unsupported.
+Use `--decompose-rotations` for phase gates and rotations before PBC conversion.
+Native Y/SX/SWAP/CY/CH/CSWAP and resets are unsupported by PBC.
 See the [PBC guide](docs/pbc.md) for the format, options, and examples.
 
 ## Circuit support
 
 tzap supports a subset of OpenQASM 2.0:
 
-- **Gates:** `h`, `x`, `z`, `s`, `sdg`, `t`, `tdg`, `rz`, `cx`, `ccx`, `ccz`, `cz`, `measure`, `reset`; `CX`, `U`, `u1`, `u2`, `u3`, and `id` lower to these gates
+- **Gates:** `h`, `x`, `z`, `s`, `sdg`, `t`, `tdg`, `p` (`u1`), `y`, `sx`, `rx`, `ry`, `rz`, `swap`, `cx`, `cy`, `ch`, `cp` (`cu1`), `crx`, `cry`, `crz`, `cswap`, `ccx`, `ccz`, `cz`, `U`, `CX`, `u2`, `u3`, `id`, `measure`, `reset`
 - **Declarations:** `qreg`, `creg`
-- **Custom gates:** parameterized `gate` definitions, calls to earlier definitions, empty bodies, and unitary register broadcasting; calls are fully inlined before optimization
-- **Not supported:** classical conditionals (`if`), `opaque`, barriers inside gate definitions, powers/functions in angle expressions, and includes besides `qelib1.inc`. Top-level barriers are ignored.
+- **Custom gates:** parameterized definitions, nested calls to earlier definitions, empty bodies, and unitary register broadcasting; fully inlined before optimization
+- **Not supported:** classical conditionals (`if`), `opaque`, barriers inside definitions, and includes besides `qelib1.inc`. Top-level barriers are ignored.
 - Unrecognized lines produce an error
 
 ```qasm
@@ -142,8 +147,8 @@ qreg q[2];
 pair(pi/4) q[0],q[1];
 ```
 
-Gate parameters support finite floating-point arithmetic with `pi`, `+`, `-`,
-`*`, `/`, unary minus, and parentheses. Formal names are local to the body;
+Gate parameters support exact symbolic arithmetic with `pi`, `+`, `-`,
+`*`, `/`, unary signs, integer powers, calculator functions, and parentheses. Formal names are local to the body;
 definitions cannot recurse, reference later gates, access global registers, or
 redefine predefined gate names. Measurement and reset are allowed only outside
 definitions. All register operands in a call must have equal widths; indexed
@@ -161,6 +166,9 @@ statements are not capped.
 
 1. **Fuzzing and equivalence verification** on small random circuits and benchmark circuits.
 2. **Lean port:** the core optimizer is implemented and proven sound in Lean 4 — see [`lean/`](lean/).
+
+The new native gate families and generalized rotation synthesis are currently
+implemented in Rust and Python; the Lean gate model has not been extended.
 
 ## Citation
 

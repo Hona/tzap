@@ -1,5 +1,8 @@
 use super::*;
 use std::f64::consts::PI;
+fn angle(source: &str) -> crate::angle::Angle {
+    crate::angle_expr::parse(source, 1).unwrap()
+}
 
 fn gates(source: &str) -> Vec<Gate> {
     parse(source).unwrap().gates
@@ -20,12 +23,12 @@ fn nested_parameters_are_scoped_and_not_periodically_reduced() {
     assert_eq!(
         gates(source),
         vec![
-            Gate::rz(PI, 2),
+            Gate::rz(angle("pi"), 2),
             Gate::cnot {
                 control: 3,
                 target: 2
             },
-            Gate::rz(PI / 2.0, 3),
+            Gate::rz(angle("pi/2"), 3),
             Gate::cnot {
                 control: 2,
                 target: 3
@@ -97,7 +100,7 @@ fn broadcasting_preserves_lane_order_and_register_offsets() {
     );
     assert_eq!(
         gates("qreg a[2]; qreg b[2]; h a; CX a,b; U(0,0,pi) b;").len(),
-        18
+        10
     );
     fails(
         "gate pair a,b {} qreg a[1]; qreg b[2]; pair a,b;",
@@ -125,7 +128,7 @@ fn definitions_validate_unused_bodies_and_signatures() {
         ("qreg global[1]; gate bad a { h global; }", "qubit formal"),
         ("gate bad(theta) a { rz(phi) a; }", "unknown parameter"),
         ("gate bad a { rz(1/0) a; }", "division by zero"),
-        ("gate bad(theta) a { rz(theta*(1e308*1e308)) a; }", "finite"),
+        ("gate bad(theta) a { rz(theta*(1e999999)) a; }", "limit"),
         ("gate bad a { CX a,a; }", "distinct"),
         ("gate bad a { CX a; }", "expects 2 qubit"),
         ("gate bad a { U(0,0) a; }", "expects 3 parameters"),
@@ -176,12 +179,10 @@ fn call_errors_are_diagnostic_and_never_partially_return_a_circuit() {
         ("gate g a {} qreg q[1]; g q[-1];", "bad qubit index"),
         (
             "gate g(x) a {} qreg q[1]; g(pi_foo) q[0];",
-            "unknown parameter",
+            "unsupported function or constant",
         ),
-        ("qreg q[1]; rz(1e309) q[0];", "finite"),
+        ("qreg q[1]; rz(1e999999) q[0];", "limit"),
         ("qreg q[1]; rz(0/0) q[0];", "division by zero"),
-        ("qreg q[1]; rz(2^3) q[0];", "unexpected character"),
-        ("qreg q[1]; rz(sin(pi)) q[0];", "unknown parameter"),
         ("include \"other.inc\";", "unsupported include"),
         ("include \"qelib1.inc;h q[0]\";", "unsupported include"),
         ("include \"unterminated", "unterminated string"),
@@ -214,7 +215,7 @@ fn comments_separate_tokens_and_track_body_lines() {
     }qreg q[1]; g(2e-1) q[0];",
     )
     .unwrap();
-    assert_eq!(c.gates, vec![Gate::rz(0.1, 0), Gate::h(0)]);
+    assert_eq!(c.gates, vec![Gate::rz(angle("0.1"), 0), Gate::h(0)]);
     fails(
         "gate g(theta) a { rz(theta// hi\n theta) a; }",
         "unexpected token",
@@ -289,9 +290,9 @@ fn expansion_limits_include_depth_total_work_and_empty_chains() {
         "(".repeat(300),
         ")".repeat(300)
     );
-    fails(&deep, "nesting limit");
+    fails(&deep, "Depth");
     let unary = format!("qreg q[1]; rz({}pi) q[0];", "-".repeat(300));
-    fails(&unary, "nesting limit");
+    fails(&unary, "Depth");
     // No custom operation cap on ordinary flat input.
     assert!(parse_with_limits("qreg q[1]; h q[0]; h q[0]; h q[0];", limits).is_ok());
 }
@@ -372,7 +373,7 @@ fn implicit_expansion_budgets_are_shared_and_allow_exact_boundaries() {
         ..limits
     };
     let flat = parse_with_limits("qreg q[1]; h q[0]; h() q[0]; U(0,0,0) q[0];", zero).unwrap();
-    assert_eq!(flat.gates.len(), 9);
+    assert_eq!(flat.gates.len(), 5);
     assert!(
         parse_with_limits("qreg q[0]; h q; U(0,0,0) q; id q;", zero)
             .unwrap()
@@ -569,12 +570,12 @@ fn random_nested_binding_matches_independent_flat_construction() {
         assert_eq!(
             c.gates,
             vec![
-                Gate::rz((phi - theta) / 2.0, 1),
+                Gate::rz(angle(&format!("({phi}-({theta}))/2")), 1),
                 Gate::cnot {
                     control: 2,
                     target: 1
                 },
-                Gate::rz(-(theta + phi) / 3.0, 2)
+                Gate::rz(angle(&format!("-(({theta})+({phi}))/3")), 2)
             ]
         );
     }
@@ -622,7 +623,7 @@ fn u_lowering_matches_independent_analytic_matrix() {
     );
     assert_eq!(
         gates("qreg q[1]; u1(pi) q[0]; id q[0];"),
-        vec![Gate::rz(PI, 0)]
+        vec![Gate::p(angle("pi"), 0)]
     );
 }
 
@@ -678,4 +679,63 @@ fn surrounding_measurement_and_reset_survive_inlining() {
             Gate::x(0)
         ]
     );
+}
+
+#[test]
+fn exact_symbolic_bindings_preserve_main_scalar_semantics() {
+    let error = parse("gate bad a { rz(1/0) a; }").unwrap_err();
+    assert_eq!(error.matches("line 1:").count(), 1, "{error}");
+    let definitions = "gate inner(t) a { rz(t) a; }
+        gate outer(x) a { inner(-x^2+sqrt(4)+sin(pi/2)) a; inner(2^3^2) a; }
+        qreg q[1]; outer(0.1+0.2) q[0];";
+    let c = parse(definitions).unwrap();
+    assert_eq!(
+        c.gates,
+        vec![Gate::rz(angle("-(3/10)^2+3"), 0), Gate::rz(angle("512"), 0)]
+    );
+    let c = parse("gate g(theta) a { rz(theta/2) a; } qreg q[1]; g(pi/7) q[0];").unwrap();
+    assert_eq!(c.gates, vec![Gate::rz(angle("pi/14"), 0)]);
+    let expression = "gate g(theta) a { rz(sin(theta)+sqrt(2)/3) a; } qreg q[1]; g(pi/7) q[0];";
+    let c = parse(expression).unwrap();
+    assert_eq!(c.gates, vec![Gate::rz(angle("sin(pi/7)+sqrt(2)/3"), 0)]);
+    assert_eq!(parse(&serialize(&c)).unwrap().gates, c.gates);
+    fails(
+        "gate g(x) a { rz(ln(x)) a; } qreg q[1]; g(-1) q[0];",
+        "real domain",
+    );
+}
+
+#[test]
+fn custom_bodies_keep_all_current_native_gates_and_literal_controls() {
+    let body = "p(t) a; y a; sx a; rx(t) a; ry(t) a; swap a,b; cy a,b; ch a,b;
+        cp(t) a,b; crx(t) a,b; cry(t) a,b; crz(t) a,b; cswap a,b,c;";
+    let custom = parse(&format!(
+        "gate g(t) a,b,c {{ {body} }} qreg q[3]; g(2*pi) q[0],q[1],q[2];"
+    ))
+    .unwrap();
+    let expected = parse(
+        "qreg q[3]; p(2*pi) q[0]; y q[0]; sx q[0]; rx(2*pi) q[0]; ry(2*pi) q[0];
+        swap q[0],q[1]; cy q[0],q[1]; ch q[0],q[1]; cp(2*pi) q[0],q[1];
+        crx(2*pi) q[0],q[1]; cry(2*pi) q[0],q[1]; crz(2*pi) q[0],q[1]; cswap q[0],q[1],q[2];",
+    )
+    .unwrap();
+    assert_eq!(custom.gates, expected.gates);
+    assert!(matches!(&custom.gates[11], Gate::crz { theta, .. } if theta == &angle("2*pi")));
+}
+
+#[test]
+fn sdk_literal_policy_survives_inlining() {
+    let source = "qreg q[1]; rz(0.1) q[0];";
+    let sdk = parse_numeric_sdk(source).unwrap();
+    assert_eq!(
+        sdk.gates,
+        vec![Gate::rz(crate::angle::Angle::from_f64(0.1).unwrap(), 0)]
+    );
+    assert_ne!(sdk.gates, parse(source).unwrap().gates);
+    assert!(parse_numeric_sdk("qreg q[1]; rz(0.1+0.2) q[0];").is_err());
+    let custom = parse_numeric_sdk("gate g(t) a { rz(t/2) a; } qreg q[1]; g(0.1) q[0];").unwrap();
+    let expected = crate::angle::AngleContext::default()
+        .half(&crate::angle::Angle::from_f64(0.1).unwrap())
+        .unwrap();
+    assert_eq!(custom.gates, vec![Gate::rz(expected, 0)]);
 }

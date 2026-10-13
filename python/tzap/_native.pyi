@@ -9,6 +9,7 @@ __all__ = [
     "TzapError",
     "__version__",
     "_optimize_qasm",
+    "_sdk_qasm",
 ]
 
 def _optimize_qasm(
@@ -17,6 +18,7 @@ def _optimize_qasm(
     level: str = "O3",
     passes: list[str] | None = None,
     fixpoint: bool = False,
+    decompose_rotations: bool = False,
     decompose_rz: bool = False,
     decompose_cz: bool = False,
     decompose_ccx: bool = False,
@@ -32,5 +34,7 @@ def _optimize_qasm(
         tuple[int, int, int, int, int],
         tuple[int, int, int, int, int],
         tuple[int, int, int, int, int],
+        tuple[int, int, int, int, int, int, bool, int, int, float | None],
     ],
 ]: ...
+def _sdk_qasm(qasm: str) -> str: ...

@@ -19,7 +19,19 @@ create_exception!(_native, QasmError, TzapError);
 create_exception!(_native, OptimizationError, TzapError);
 
 type RawMetrics = (usize, usize, usize, usize, usize);
-type RawReport = (RawMetrics, RawMetrics, RawMetrics);
+type RawNumerical = (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    bool,
+    usize,
+    usize,
+    Option<f64>,
+);
+type RawReport = (RawMetrics, RawMetrics, RawMetrics, RawNumerical);
 
 fn raw_metrics(metrics: Metrics) -> RawMetrics {
     (
@@ -36,6 +48,18 @@ fn raw_report(report: Report) -> RawReport {
         raw_metrics(report.input),
         raw_metrics(report.baseline),
         raw_metrics(report.output),
+        (
+            report.numerical.preserved_expressions,
+            report.numerical.numerical_fallbacks,
+            report.numerical.skipped_rounded_folds,
+            report.numerical.skipped_nonfinite_folds,
+            report.numerical.skipped_coefficient_limit_folds,
+            report.numerical.uncertified_syntheses,
+            report.numerical.randomized_matching,
+            report.numerical.certified_syntheses,
+            report.numerical.failed_certifications,
+            report.numerical.certified_error_bound,
+        ),
     )
 }
 
@@ -95,6 +119,7 @@ fn positive_bound(value: Option<usize>, name: &str) -> PyResult<Option<usize>> {
     level = "O3",
     passes = None,
     fixpoint = false,
+    decompose_rotations = false,
     decompose_rz = false,
     decompose_cz = false,
     decompose_ccx = false,
@@ -112,6 +137,7 @@ fn _optimize_qasm(
     level: &str,
     passes: Option<Vec<String>>,
     fixpoint: bool,
+    decompose_rotations: bool,
     decompose_rz: bool,
     decompose_cz: bool,
     decompose_ccx: bool,
@@ -129,7 +155,7 @@ fn _optimize_qasm(
     }
 
     let passes = parse_passes(passes)?;
-    if passes.is_some() && (decompose_rz || decompose_cz || decompose_ccx) {
+    if passes.is_some() && (decompose_rotations || decompose_rz || decompose_cz || decompose_ccx) {
         return Err(PyValueError::new_err(
             "passes cannot be combined with decomposition options; include the decomposition passes instead",
         ));
@@ -139,6 +165,7 @@ fn _optimize_qasm(
         level: parse_level(level)?,
         passes,
         fixpoint,
+        decompose_rotations,
         decompose_rz,
         decompose_cz,
         decompose_ccx,
@@ -156,13 +183,22 @@ fn _optimize_qasm(
     let (optimized, report) = py
         .detach(|| optimize(&circuit, &options))
         .map_err(|error| OptimizationError::new_err(error.to_string()))?;
-    Ok((optimized.to_qasm(), raw_report(report)))
+    let output = optimized.to_qasm();
+    Ok((output, raw_report(report)))
+}
+
+/// Convert native output without collapsing mixed angles into SDK floats.
+#[pyfunction]
+fn _sdk_qasm(qasm: &str) -> PyResult<String> {
+    let circuit = Circuit::from_qasm(qasm).map_err(QasmError::new_err)?;
+    crate::qasm::serialize_sdk(&circuit).map_err(OptimizationError::new_err)
 }
 
 #[pymodule]
 #[pyo3(name = "_native")]
 fn python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_optimize_qasm, module)?)?;
+    module.add_function(wrap_pyfunction!(_sdk_qasm, module)?)?;
     let tzap_error = module.py().get_type::<TzapError>();
     let qasm_error = module.py().get_type::<QasmError>();
     let optimization_error = module.py().get_type::<OptimizationError>();

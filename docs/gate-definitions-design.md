@@ -1,7 +1,8 @@
 # OpenQASM 2 gate definitions in tzap
 
-Status: implemented, 2026-10-13. Baseline: local `main` at `ec8a3bd`
-(tzap 0.7.0). Work branch: `codex/gate-definitions`.
+Status: implemented and integrated with `main` at `76588fe`, 2026-10-13
+(tzap 0.8.0). Original design baseline: `ec8a3bd` (0.7.0).
+Work branch: `codex/gate-definitions`.
 
 Accept custom `gate` definitions and inline every executed call before returning
 a `Circuit`. Keep `Circuit`, `Gate`, register storage, and the optimizer pass
@@ -57,7 +58,7 @@ twice(pi/4) q[0],q[1];
 ```
 
 Parsing produces two repetitions of `rz(pi/8) q[0]; cx q[0],q[1];
-rz(-pi/8) q[1];`, represented using the current numeric gate fields. The
+rz(-pi/8) q[1];`, represented using exact symbolic angle values. The
 optimizer may subsequently combine operations across the original call boundary.
 
 ## Frontend structure
@@ -167,22 +168,21 @@ library definitions or shadowing is later work.
 
 ## Parameter evaluation
 
-Refactor the current angle parser into expression parsing plus evaluation.
-The initial expression subset is numbers/scientific notation, `pi`, formal
-parameters, `+`, `-`, `*`, `/`, unary minus, and parentheses. Powers and calculator
-functions receive explicit unsupported-expression errors and are deferred.
+Parameter templates use resolved postfix operations and formal parameter IDs.
+Closed expressions share the current exact scalar parser and cache. Template
+binding uses the same `AngleContext` arithmetic, functions, domains, integer
+powers, and resource checks as closed scalar expressions. QASM decimals remain
+exact rationals and `pi` remains mathematical pi; no binary64 evaluation is
+introduced by inlining. Unary signs and powers keep the scalar parser's
+precedence and right associativity.
 
-Evaluate each actual parameter in the caller's environment. Bind those values
-by formal ID, then evaluate the callee's body expressions in its own environment.
-Nested calls receive newly bound values, not names from a parent's scope. Use
-the same evaluator for top-level native gate parameters and definition bodies.
-Preserve syntax evaluation order; do not reassociate arithmetic or substitute
-text. Reject nonfinite inputs/results and division by zero with source context.
-
-Keep the current finite `f64` policy and existing `Gate` fields. This work does
-not introduce a new angle representation.
-If a separate angle migration lands first, adapt expression evaluation at the frontend
-boundary without adding unresolved values to `Circuit`.
+Evaluate actual parameters in the caller's environment and bind exact `Angle`
+values by formal ID. Evaluate body expressions in the callee's environment.
+Do not substitute source text or reduce literal parameters modulo a gate period.
+Per-operation scalar limits and context interner rotation remain active.
+`parse_numeric_sdk` keeps finite binary64 input literals, rejects top-level
+nonliteral parameters, and permits structural arithmetic on those bound values
+inside definitions. Ordinary QASM uses exact mathematical source semantics.
 
 Never reduce a bound parameter modulo an angle period before body evaluation.
 For example, `theta = 2*pi` must yield `theta/2 = pi`; a body implementing
@@ -203,35 +203,18 @@ Lower `CX a,b` to `Gate::cnot`. The QASM 2 paper defines
 `U(theta,phi,lambda) = Rz(phi) Ry(theta) Rz(lambda)`.
 [OpenQASM 2 specification, equation 2][qasm2]
 
-This baseline has no native `ry` variant. Lower `U` in execution order to:
+Lower `U` in execution order to `rz(lambda); ry(theta); rz(phi)` using
+current native variants. Support `u3` through the same lowering, `u2(phi,lambda)`
+through `U(pi/2,phi,lambda)`, and `id` through an empty expansion. Keep `u1` as
+native P and `cu1` as native CP, preserving the current serializer and library
+conventions. The complete-circuit phase contract covers alternative U conventions
+that differ only by a scalar.
 
-```qasm
-rz(lambda) q;
-sdg q;
-h q;
-rz(theta) q;
-h q;
-s q;
-rz(phi) q;
-```
-
-The middle five operations implement `Ry(theta)` using existing gates. No
-native gate variants are added. Verify this identity independently as part of
-the primitive tests.
-
-Support `u3` through the same lowering, `u2(phi,lambda)` through
-`U(pi/2,phi,lambda)`, and `id` through an empty expansion. Add `u1(lambda)`
-as a frontend alias emitting `rz(lambda)`, with their scalar difference covered
-by the complete-circuit phase contract. Pin the matrix convention and check compatibility
-with common exported QASM: U conventions differing by a scalar are acceptable
-only under the complete-circuit phase contract.
-
-No generic quantum control is added. A custom controlled operation must express
-its control using actual gates in its body. Preserve those relative phases;
-never remove phase terms on the control or turn a custom call into a native
-operation merely because its name resembles one. Native gates absent from
-this baseline, including `cp`, `crz`, `rx`, and `ry`, remain unsupported unless
-expressed as custom definitions with supported bodies.
+Every current native unitary is available inside definitions, including phase,
+axis/controlled rotations, Y/SX, SWAP/CSWAP, and controlled Y/H. No gate variants
+or generic quantum controls are added. A custom controlled operation must
+express its control using actual gates in the body; retain all control-relative
+phase terms and literal angles.
 
 ## Operand binding and broadcasting
 
@@ -350,7 +333,9 @@ unresolved regression in parsing ordinary large circuits.
 ## Validation measurements
 
 The release parser was compared to an independently compiled parser from the
-baseline above. Nine parses per input were timed in one process; figures below
+original 0.7.0 baseline, before integration with symbolic angles. These are
+historical measurements of the initial frontend, not current 0.8.0 performance
+claims. Nine parses per input were timed in one process; figures below
 are median wall time. macOS maximum resident set size covers the benchmark
 process, including its input and allocator, rather than just the circuit.
 
