@@ -152,7 +152,7 @@ pub(super) fn call(
     let Evaluation { limits, angles } = evaluation;
     let (name, params, qubits) = definitions::call_parts(source, line)?;
     let callee = registry.lookup(name, line)?;
-    let expressions = definitions::expressions(params, &[], limits, line, angles)?;
+    let expressions = definitions::expressions(params, None, limits, line, angles)?;
     let parameters = definitions::evaluate(&expressions, &[], line, angles)?;
     let args: SmallVec<[Operand; 3]> = definitions::comma_list(qubits)
         .map(|s| operand(s, registers, line, false))

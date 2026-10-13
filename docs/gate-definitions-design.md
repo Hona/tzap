@@ -182,7 +182,9 @@ Do not substitute source text or reduce literal parameters modulo a gate period.
 Per-operation scalar limits and context interner rotation remain active.
 `parse_numeric_sdk` keeps finite binary64 input literals, rejects top-level
 nonliteral parameters, and permits structural arithmetic on those bound values
-inside definitions. Ordinary QASM uses exact mathematical source semantics.
+inside definitions. Body constants and expressions use mathematical semantics,
+including exact decimals and `pi`, even in definitions without formals.
+Ordinary QASM uses exact mathematical source semantics.
 
 Never reduce a bound parameter modulo an angle period before body evaluation.
 For example, `theta = 2*pi` must yield `theta/2 = pi`; a body implementing

@@ -340,7 +340,8 @@ impl Registry {
                 ));
             }
             let callee = self.lookup(callee_name, statement.line)?;
-            let expressions = expressions(params, &parameters, limits, statement.line, angles)?;
+            let expressions =
+                expressions(params, Some(&parameters), limits, statement.line, angles)?;
             let mut args = SmallVec::<[usize; 3]>::new();
             for operand in comma_list(operands) {
                 let i = qubits.iter().position(|q| q == operand).ok_or_else(|| {
@@ -431,7 +432,7 @@ pub(super) fn call_parts(s: &str, line: usize) -> Result<(&str, Option<&str>, &s
 
 pub(super) fn expressions(
     s: Option<&str>,
-    parameters: &[String],
+    parameters: Option<&[String]>,
     limits: ParseLimits,
     line: usize,
     angles: &mut AngleParser,

@@ -1,5 +1,5 @@
 //! Resolved postfix templates bind formal parameters to exact scalar angles.
-use super::{AngleParser, parse_angle_with, scan::identifier};
+use super::{AngleParser, parse_angle_with, parse_math_angle_with, scan::identifier};
 use crate::angle::{Angle, AngleContext, AngleError};
 use crate::symbolic_angle::{Function, Resource};
 
@@ -65,16 +65,23 @@ impl Expr {
     }
     pub fn parse(
         source: &str,
-        parameters: &[String],
+        parameters: Option<&[String]>,
         max_depth: usize,
         angles: &mut AngleParser,
         line: usize,
     ) -> Result<Self, String> {
-        // Closed expressions share main's exact parser/cache and SDK policy.
-        if parameters.is_empty() {
+        // Only top-level actuals use the SDK's binary64 literal policy.
+        let Some(parameters) = parameters else {
             return Ok(Self {
                 code: Vec::new(),
                 constant: Some(parse_angle_with(angles, source, line)?),
+            });
+        };
+        // A body without formals still contains mathematical expressions.
+        if parameters.is_empty() {
+            return Ok(Self {
+                code: Vec::new(),
+                constant: Some(parse_math_angle_with(angles, source, line)?),
             });
         }
         if source.len() > angles.context.limits().max_source_bytes {
@@ -145,7 +152,7 @@ struct Parser<'a, 'c> {
 }
 impl Parser<'_, '_> {
     fn literal(&mut self, source: &str) -> Result<Angle, String> {
-        parse_angle_with(self.angles, source, self.line).map_err(|e| {
+        parse_math_angle_with(self.angles, source, self.line).map_err(|e| {
             e.strip_prefix(&format!("line {}: ", self.line))
                 .unwrap_or(&e)
                 .to_owned()

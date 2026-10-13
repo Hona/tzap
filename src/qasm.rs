@@ -387,9 +387,6 @@ fn parse_angle_with(
     line: usize,
 ) -> Result<crate::angle::Angle, String> {
     let source = s.trim();
-    if let Some(a) = parser.cache.get(source) {
-        return Ok(a.clone());
-    }
     if parser.numeric_literals {
         return source
             .parse::<f64>()
@@ -397,6 +394,18 @@ fn parse_angle_with(
             .and_then(|v| {
                 crate::angle::Angle::from_f64(v).map_err(|e| format!("line {line}: {e}"))
             });
+    }
+    parse_math_angle_with(parser, source, line)
+}
+
+fn parse_math_angle_with(
+    parser: &mut AngleParser,
+    source: &str,
+    line: usize,
+) -> Result<crate::angle::Angle, String> {
+    let source = source.trim();
+    if let Some(a) = parser.cache.get(source) {
+        return Ok(a.clone());
     }
     let mut result = parser.context.parse(source);
     if matches!(

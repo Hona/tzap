@@ -739,3 +739,35 @@ fn sdk_literal_policy_survives_inlining() {
         .unwrap();
     assert_eq!(custom.gates, vec![Gate::rz(expected, 0)]);
 }
+
+#[test]
+fn sdk_custom_bodies_use_mathematical_constants_and_bound_binary64_values() {
+    let source = "gate inner(t) a { rz(t+pi/2) a; rz(t+0.1) a; }
+        gate constants a { rz(sin(pi/2)+0.1) a; }
+        gate outer(t) a { inner(t/2) a; constants a; }
+        qreg q[1]; outer(0.1) q[0]; rz(0.1) q[0];";
+    let custom = parse_numeric_sdk(source).unwrap();
+    let mut context = crate::angle::AngleContext::default();
+    let input = crate::angle::Angle::from_f64(0.1).unwrap();
+    let half = context.half(&input).unwrap();
+    let shifted_pi = context.add(&half, &angle("pi/2")).unwrap();
+    let shifted_decimal = context.add(&half, &angle("1/10")).unwrap();
+    assert_eq!(
+        custom.gates,
+        vec![
+            Gate::rz(shifted_pi, 0),
+            Gate::rz(shifted_decimal, 0),
+            Gate::rz(angle("11/10"), 0),
+            Gate::rz(input, 0),
+        ]
+    );
+    // Mathematical body constants must not bypass the SDK input policy via
+    // the shared scalar cache, even when the same source occurs at top level.
+    for source in ["pi", "0.1+0.2"] {
+        let error = parse_numeric_sdk(&format!(
+            "gate constants a {{ rz({source}) a; }} qreg q[1]; rz({source}) q[0];"
+        ))
+        .unwrap_err();
+        assert!(error.contains("SDK parameter must be a numeric literal"));
+    }
+}
