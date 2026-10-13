@@ -133,34 +133,9 @@ tzap supports a subset of OpenQASM 2.0:
 
 - **Gates:** `h`, `x`, `z`, `s`, `sdg`, `t`, `tdg`, `p` (`u1`), `y`, `sx`, `rx`, `ry`, `rz`, `swap`, `cx`, `cy`, `ch`, `cp` (`cu1`), `crx`, `cry`, `crz`, `cswap`, `ccx`, `ccz`, `cz`, `U`, `CX`, `u2`, `u3`, `id`, `measure`, `reset`
 - **Declarations:** `qreg`, `creg`
-- **Custom gates:** parameterized definitions, nested calls to earlier definitions, empty bodies, and unitary register broadcasting; fully inlined before optimization
+- **Custom gates:** custom gate definitions are supported and inlined before optimization
 - **Not supported:** classical conditionals (`if`), `opaque`, barriers inside definitions, and includes besides `qelib1.inc`. Top-level barriers are ignored.
 - Unrecognized lines produce an error
-
-```qasm
-gate pair(theta) a,b {
-    rz(theta/2) a;
-    cx a,b;
-    rz(-theta/2) b;
-}
-qreg q[2];
-pair(pi/4) q[0],q[1];
-```
-
-Gate parameters support exact symbolic arithmetic with `pi`, `+`, `-`,
-`*`, `/`, unary signs, integer powers, calculator functions, and parentheses. Formal names are local to the body;
-definitions cannot recurse, reference later gates, access global registers, or
-redefine predefined gate names. Measurement and reset are allowed only outside
-definitions. All register operands in a call must have equal widths; indexed
-qubits broadcast across them. Output is flat QASM, and reported gate counts
-describe the expanded circuit. See the [gate design](docs/gate-definitions-design.md)
-for expansion limits and implementation details.
-
-Custom calls and native register broadcasts share output/work limits checked
-before expansion. Work includes call visits, bound operands/parameters, and
-expression evaluation. Identity broadcasts consume work even though they emit
-no gates. Aliases are checked once before broadcasting. Explicit indexed native
-statements are not capped.
 
 ## Correctness
 
