@@ -135,7 +135,6 @@ tzap supports a subset of OpenQASM 2.0:
 - **Declarations:** `qreg`, `creg`
 - **Custom gates:** custom gate definitions are supported and inlined before optimization
 - **Not supported:** classical conditionals (`if`), `opaque`, barriers inside definitions, and includes besides `qelib1.inc`. Top-level barriers are ignored.
-- Unrecognized lines produce an error
 
 ## Correctness
 
