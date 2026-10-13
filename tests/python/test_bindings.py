@@ -48,9 +48,7 @@ def test_custom_gates_inline_and_optimize_across_calls():
 
 
 def test_custom_gate_parameter_failure_raises_qasm_error_with_call_trace():
-    source = make_qasm(
-        "gate g(theta) a { rz(1/theta) a; } g(0) q[0];"
-    )
+    source = make_qasm("gate g(theta) a { rz(1/theta) a; } g(0) q[0];")
     with pytest.raises(tzap.QasmError, match="division by zero") as exc:
         tzap.optimize_qasm(source, passes=["CancelGates"])
     assert "called 'g'" in str(exc.value)
