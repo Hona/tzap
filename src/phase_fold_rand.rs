@@ -11,7 +11,7 @@ use crate::pass::{Pass, PassState};
 /// A random evaluation of a Boolean polynomial in GF(2^128), together with
 /// an upper bound on its total degree and an optional bitmask of the first
 /// 128 degree-one variables when the wire is still affine. Addition is XOR;
-/// multiplication is carry-less multiplication modulo x^128 + x^7 + x + 1,
+/// multiplication is carry-less multiplication modulo x^128 + x^7 + x^2 + x + 1,
 /// with Frobenius square reduction `x_i^2 -> x_i` on shared affine variables.
 #[derive(Clone, Copy)]
 struct Fingerprint {
