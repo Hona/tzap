@@ -43,4 +43,16 @@ theorem field128_badProbability_bound (circuit : RawCircuit) :
   simpa only [field128_card] using
     nonlinearCircuit_badProbability_bound (K := Field128) circuit
 
+/-- In any characteristic-two commutative ring `K` (including `Field128`), subtracting
+`x0 * x0 + x0` for a shared linear variable `x0` reduces `x0 * (x0 + x1)` to its
+canonical multilinear form `x0 * x1 + x0`, recovering `x2` on shared-control CCX pairs. -/
+theorem frobenius_multilinear_shared_control {K : Type*} [CommRing K] [CharP K 2]
+    (x0 x1 x2 : K) :
+    x2 + (x0 * (x0 + x1) + (x0 * x0 + x0)) + x0 * x1 + x0 = x2 := by
+  have hchar : ∀ a : K, a + a = 0 := CharP.add_self_eq_zero
+  calc
+    x2 + (x0 * (x0 + x1) + (x0 * x0 + x0)) + x0 * x1 + x0
+      = x2 + (x0 * x0 + x0 * x0) + (x0 * x1 + x0 * x1) + (x0 + x0) := by ring
+    _ = x2 := by simp [hchar]
+
 end TzapLean.GF128Proof

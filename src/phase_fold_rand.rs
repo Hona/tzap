@@ -9,12 +9,15 @@ use crate::circuit::{Circuit, Gate, Qubit};
 use crate::pass::{Pass, PassState};
 
 /// A random evaluation of a Boolean polynomial in GF(2^128), together with
-/// an upper bound on its total degree. Addition is XOR; multiplication is
-/// carry-less multiplication modulo x^128 + x^7 + x^2 + x + 1.
+/// an upper bound on its total degree and an optional bitmask of the first
+/// 128 degree-one variables when the wire is still affine. Addition is XOR;
+/// multiplication is carry-less multiplication modulo x^128 + x^7 + x + 1,
+/// with Frobenius square reduction `x_i^2 -> x_i` on shared affine variables.
 #[derive(Clone, Copy)]
 struct Fingerprint {
     value: u128,
     degree: u64,
+    affine_mask: Option<u128>,
 }
 
 const FIELD_ONE: u128 = 1;
@@ -22,12 +25,60 @@ const FIELD_ONE: u128 = 1;
 /// comparison in the 128-bit field.
 const MAX_TRACKED_DEGREE: u64 = 1 << 32;
 
+struct BasisDraws {
+    draws: [u128; 128],
+    len: usize,
+}
+
+impl BasisDraws {
+    fn new() -> Self {
+        Self {
+            draws: [0; 128],
+            len: 0,
+        }
+    }
+
+    fn fresh(&mut self) -> Fingerprint {
+        let hi = RandomState::new().build_hasher().finish() as u128;
+        let lo = RandomState::new().build_hasher().finish() as u128;
+        let value = (hi << 64) | lo;
+        let affine_mask = if self.len < 128 {
+            let idx = self.len;
+            self.draws[idx] = value;
+            self.len += 1;
+            Some(1u128 << idx)
+        } else {
+            None
+        };
+        Fingerprint {
+            value,
+            degree: 1,
+            affine_mask,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn shared_linear_eval(&self, mut mask: u128) -> u128 {
+        let mut acc = 0u128;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            acc ^= self.draws[idx];
+            mask &= mask - 1;
+        }
+        acc
+    }
+}
+
 fn fresh_fingerprint() -> Fingerprint {
     let hi = RandomState::new().build_hasher().finish() as u128;
     let lo = RandomState::new().build_hasher().finish() as u128;
     Fingerprint {
         value: (hi << 64) | lo,
         degree: 1,
+        affine_mask: None,
     }
 }
 
@@ -90,7 +141,8 @@ pub fn phase_fold_rand(circuit: &Circuit) -> Circuit {
 }
 fn phase_fold_rand_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Circuit {
     let n = circuit.num_qubits;
-    let mut qubits: Vec<Fingerprint> = (0..n).map(|_| fresh_fingerprint()).collect();
+    let mut basis = BasisDraws::new();
+    let mut qubits: Vec<Fingerprint> = (0..n).map(|_| basis.fresh()).collect();
 
     let mut live: Vec<LivePhase> = Vec::new();
     let mut fingerprint_to_group: FxHashMap<u128, usize> = FxHashMap::default();
@@ -175,12 +227,13 @@ fn phase_fold_rand_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Ci
                 // Native transfer rules are separate work. End the current
                 // phase-analysis region and retain this operation verbatim.
                 fingerprint_to_group.clear();
+                basis.clear();
                 for value in &mut qubits {
-                    *value = fresh_fingerprint();
+                    *value = basis.fresh();
                 }
             }
             Gate::h(q) => {
-                qubits[*q as usize] = fresh_fingerprint();
+                qubits[*q as usize] = basis.fresh();
             }
             Gate::x(q) => {
                 qubits[*q as usize].value ^= FIELD_ONE;
@@ -190,6 +243,10 @@ fn phase_fold_rand_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Ci
                 let target = &mut qubits[*target as usize];
                 target.value ^= control.value;
                 target.degree = target.degree.max(control.degree);
+                target.affine_mask = target
+                    .affine_mask
+                    .zip(control.affine_mask)
+                    .map(|(a, b)| a ^ b);
             }
             Gate::cz { .. } | Gate::ccz { .. } => {
                 // CZ and CCZ are diagonal: they change phase but leave the tracked
@@ -205,10 +262,32 @@ fn phase_fold_rand_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Ci
                 let right = qubits[*control2 as usize];
                 let target_state = qubits[*target as usize];
                 qubits[*target as usize] = match left.degree.checked_add(right.degree) {
-                    Some(product_degree) if product_degree <= MAX_TRACKED_DEGREE => Fingerprint {
-                        value: target_state.value ^ field_mul(left.value, right.value),
-                        degree: target_state.degree.max(product_degree),
-                    },
+                    Some(product_degree) if product_degree <= MAX_TRACKED_DEGREE => {
+                        let (prod_val, prod_deg, prod_mask) =
+                            if let (Some(m1), Some(m2)) = (left.affine_mask, right.affine_mask) {
+                                let v_shared = basis.shared_linear_eval(m1 & m2);
+                                // By Frobenius linearity in GF(2^128), (sum_{i in S} a_i)^2 = sum_{i in S} a_i^2.
+                                // Subtracting v_shared^2 ^ v_shared reduces x_i^2 -> x_i in the multilinear Boolean quotient.
+                                let correction = field_mul(v_shared, v_shared) ^ v_shared;
+                                let val = field_mul(left.value, right.value) ^ correction;
+                                if m1 == m2 {
+                                    if left.value == right.value {
+                                        (val, left.degree, Some(m1))
+                                    } else {
+                                        (0, 0, Some(0))
+                                    }
+                                } else {
+                                    (val, product_degree, None)
+                                }
+                            } else {
+                                (field_mul(left.value, right.value), product_degree, None)
+                            };
+                        Fingerprint {
+                            value: target_state.value ^ prod_val,
+                            degree: target_state.degree.max(prod_deg),
+                            affine_mask: target_state.affine_mask.zip(prod_mask).map(|(a, b)| a ^ b),
+                        }
+                    }
                     // At extreme degree the Schwartz–Zippel collision bound is
                     // no longer useful. Treat the target's current Boolean
                     // function as a new opaque variable: subsequent equalities
@@ -228,6 +307,7 @@ fn phase_fold_rand_with_context(circuit: &Circuit, ctx: &mut AngleContext) -> Ci
                 qubits[*qubit as usize] = Fingerprint {
                     value: 0,
                     degree: 0,
+                    affine_mask: Some(0),
                 };
             }
         }
@@ -337,6 +417,7 @@ mod tests {
         let qubits = [Fingerprint {
             value: 2,
             degree: 1,
+            affine_mask: None,
         }; 2];
         let mut live = Vec::new();
         let mut groups = FxHashMap::default();
@@ -1385,6 +1466,41 @@ mod tests {
         circuit.apply(Gate::tdg(2));
 
         let folded = phase_fold_rand(&circuit);
+        assert_eq!(count_phase_gates(&folded), 0);
+        assert!(circuits_equiv(&circuit, &folded, 1e-10));
+    }
+
+    #[test]
+    fn nonlinear_shared_control_with_x_complement_annihilates() {
+        // CNOT(0,1); X(1) puts q1 in x0 ^ x1 ^ 1.
+        // Two CCX(0,1,2) separated by X(1) add x0*(x0^x1^1) ^ x0*(x0^x1) = x0 to q2,
+        // which CNOT(0,2) then cancels so T(2) and Tdg(2) annihilate.
+        let mut circuit = Circuit::new(3);
+        circuit.apply(Gate::t(2));
+        circuit.apply(Gate::cnot {
+            control: 0,
+            target: 1,
+        });
+        circuit.apply(Gate::x(1));
+        circuit.apply(Gate::ccx {
+            control1: 0,
+            control2: 1,
+            target: 2,
+        });
+        circuit.apply(Gate::x(1));
+        circuit.apply(Gate::ccx {
+            control1: 0,
+            control2: 1,
+            target: 2,
+        });
+        circuit.apply(Gate::cnot {
+            control: 0,
+            target: 2,
+        });
+        circuit.apply(Gate::tdg(2));
+
+        let folded = phase_fold_rand(&circuit);
+        assert_eq!(count_phase_gates(&folded), 0);
         assert!(circuits_equiv(&circuit, &folded, 1e-10));
     }
 
